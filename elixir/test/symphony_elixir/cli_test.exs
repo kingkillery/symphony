@@ -136,4 +136,108 @@ defmodule SymphonyElixir.CLITest do
 
     assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
   end
+
+  test "returns usage error when extra positional arguments are provided" do
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert {:error, message} = CLI.evaluate([@ack_flag, "a.md", "b.md"], deps)
+    assert message =~ "Usage:"
+  end
+
+  test "returns usage error when --logs-root value is empty" do
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert {:error, message} = CLI.evaluate([@ack_flag, "--logs-root", "  "], deps)
+    assert message =~ "Usage:"
+  end
+
+  test "accepts --port and passes it to the port override dep" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn port ->
+        send(parent, {:port_set, port})
+        :ok
+      end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert :ok = CLI.evaluate([@ack_flag, "--port", "4000", "WORKFLOW.md"], deps)
+    assert_received {:port_set, 4000}
+  end
+
+  test "accepts --port 0 for random port assignment" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn port ->
+        send(parent, {:port_set, port})
+        :ok
+      end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert :ok = CLI.evaluate([@ack_flag, "--port", "0"], deps)
+    assert_received {:port_set, 0}
+  end
+
+  test "uses last value when --logs-root is specified multiple times" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn path ->
+        send(parent, {:logs_root, path})
+        :ok
+      end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert :ok =
+             CLI.evaluate(
+               [@ack_flag, "--logs-root", "first", "--logs-root", "second", "WORKFLOW.md"],
+               deps
+             )
+
+    assert_received {:logs_root, path}
+    assert path == Path.expand("second")
+  end
+
+  test "uses last value when --port is specified multiple times" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn port ->
+        send(parent, {:port_set, port})
+        :ok
+      end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    assert :ok = CLI.evaluate([@ack_flag, "--port", "3000", "--port", "5000"], deps)
+    assert_received {:port_set, 5000}
+  end
 end
