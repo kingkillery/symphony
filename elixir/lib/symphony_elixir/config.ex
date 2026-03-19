@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Config do
 
   Identifier: {{ issue.identifier }}
   Title: {{ issue.title }}
+  Preferred workflow tool: `linear_workflow`
 
   Body:
   {% if issue.description %}
@@ -25,6 +26,9 @@ defmodule SymphonyElixir.Config do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
+
+  @type lifecycle_role ::
+          :backlog | :todo | :in_progress | :human_review | :merging | :rework | :done
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
@@ -82,6 +86,18 @@ defmodule SymphonyElixir.Config do
         @default_prompt_template
     end
   end
+
+  @spec workpad_marker() :: String.t()
+  def workpad_marker do
+    settings!().tracker.workpad_marker
+  end
+
+  @spec lifecycle_state(lifecycle_role()) :: String.t() | nil
+  def lifecycle_state(role) when role in [:backlog, :todo, :in_progress, :human_review, :merging, :rework, :done] do
+    settings!().tracker.lifecycle_states |> Map.get(role)
+  end
+
+  def lifecycle_state(_role), do: nil
 
   @spec server_port() :: non_neg_integer() | nil
   def server_port do

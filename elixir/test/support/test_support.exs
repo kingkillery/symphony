@@ -99,6 +99,16 @@ defmodule SymphonyElixir.TestSupport do
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+          tracker_workpad_marker: "## Codex Workpad",
+          tracker_lifecycle_states: %{
+            backlog: "Backlog",
+            todo: "Todo",
+            in_progress: "In Progress",
+            human_review: "Human Review",
+            merging: "Merging",
+            rework: "Rework",
+            done: "Done"
+          },
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
@@ -124,6 +134,8 @@ defmodule SymphonyElixir.TestSupport do
           observability_render_interval_ms: 16,
           server_port: nil,
           server_host: nil,
+          harness_bootstrap_enabled: true,
+          harness_bootstrap_mode: "core",
           prompt: @workflow_prompt
         ],
         overrides
@@ -136,6 +148,8 @@ defmodule SymphonyElixir.TestSupport do
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
+    tracker_workpad_marker = Keyword.get(config, :tracker_workpad_marker)
+    tracker_lifecycle_states = Keyword.get(config, :tracker_lifecycle_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
@@ -161,6 +175,8 @@ defmodule SymphonyElixir.TestSupport do
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
+    harness_bootstrap_enabled = Keyword.get(config, :harness_bootstrap_enabled)
+    harness_bootstrap_mode = Keyword.get(config, :harness_bootstrap_mode)
     prompt = Keyword.get(config, :prompt)
 
     sections =
@@ -174,6 +190,8 @@ defmodule SymphonyElixir.TestSupport do
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
+        "  workpad_marker: #{yaml_value(tracker_workpad_marker)}",
+        "  lifecycle_states: #{yaml_value(tracker_lifecycle_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
@@ -195,6 +213,7 @@ defmodule SymphonyElixir.TestSupport do
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
+        harness_yaml(harness_bootstrap_enabled, harness_bootstrap_mode),
         "---",
         prompt
       ]
@@ -274,6 +293,16 @@ defmodule SymphonyElixir.TestSupport do
       host && "  host: #{yaml_value(host)}"
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp harness_yaml(enabled, mode) do
+    [
+      "harness:",
+      "  bootstrap:",
+      "    enabled: #{yaml_value(enabled)}",
+      "    mode: #{yaml_value(mode)}"
+    ]
     |> Enum.join("\n")
   end
 

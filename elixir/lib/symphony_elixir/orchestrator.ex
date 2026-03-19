@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RuntimeStateStore, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -31,6 +31,8 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :tracker_status,
+      :shutdown_state,
       :tick_timer_ref,
       :tick_token,
       running: %{},
@@ -48,24 +50,39 @@ defmodule SymphonyElixir.Orchestrator do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @spec shutdown(GenServer.server()) :: :ok | {:error, term()}
+  def shutdown(server \\ __MODULE__) do
+    if Process.whereis(server) do
+      GenServer.call(server, :shutdown, 30_000)
+    else
+      {:error, :unavailable}
+    end
+  end
+
   @impl true
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+    recovered = load_persisted_runtime_state()
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
       max_concurrent_agents: config.agent.max_concurrent_agents,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
+      tracker_status: Map.get(recovered, :tracker_status, tracker_status(:idle)),
+      shutdown_state: nil,
       tick_timer_ref: nil,
       tick_token: nil,
+      claimed: Map.get(recovered, :claimed, MapSet.new()),
+      retry_attempts: Map.get(recovered, :retry_attempts, %{}),
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
 
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
+    persist_runtime_state(state)
 
     {:ok, state}
   end
@@ -109,9 +126,10 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    state = schedule_tick(state, next_poll_delay_ms(state))
     state = %{state | poll_check_in_progress: false}
 
+    persist_runtime_state(state)
     notify_dashboard()
     {:noreply, state}
   end
@@ -158,6 +176,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
+        persist_runtime_state(state)
         notify_dashboard()
         {:noreply, state}
     end
@@ -175,8 +194,10 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+        persist_runtime_state(next_state)
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, next_state}
     end
   end
 
@@ -196,8 +217,10 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
+        next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+        persist_runtime_state(next_state)
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, next_state}
     end
   end
 
@@ -209,6 +232,11 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
         :missing -> {:noreply, state}
       end
+
+    case result do
+      {:noreply, %State{} = next_state} -> persist_runtime_state(next_state)
+      _ -> :ok
+    end
 
     notify_dashboard()
     result
@@ -227,48 +255,50 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      state
+      |> put_tracker_status(:ok, nil)
+      |> choose_issues(issues)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
-        state
+        put_tracker_status(state, :error, "missing_linear_api_token")
 
       {:error, :missing_linear_project_slug} ->
         Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
+        put_tracker_status(state, :error, "missing_linear_project_slug")
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
-        state
+        put_tracker_status(state, :error, "missing_tracker_kind")
 
       {:error, {:unsupported_tracker_kind, kind}} ->
         Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-        state
+        put_tracker_status(state, :error, "unsupported_tracker_kind")
 
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+        put_tracker_status(state, :error, message)
 
       {:error, {:missing_workflow_file, path, reason}} ->
         Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        put_tracker_status(state, :error, "missing_workflow_file")
 
       {:error, :workflow_front_matter_not_a_map} ->
         Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        put_tracker_status(state, :error, "workflow_front_matter_not_a_map")
 
       {:error, {:workflow_parse_error, reason}} ->
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        put_tracker_status(state, :error, inspect(reason))
 
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
+        handle_tracker_fetch_failure(state, reason)
 
       false ->
-        state
+        put_tracker_status(state, :idle, nil)
     end
   end
 
@@ -516,7 +546,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
-  defp choose_issues(issues, state) do
+  defp choose_issues(state, issues) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
@@ -831,14 +861,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+        |> handle_retry_issue_lookup(put_tracker_status(state, :ok, nil), issue_id, attempt, metadata)
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
 
         {:noreply,
          schedule_issue_retry(
-           state,
+           handle_tracker_fetch_failure(state, reason),
            issue_id,
            attempt + 1,
            Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
@@ -1146,6 +1176,8 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       tracker: Map.get(state, :tracker_status),
+       shutdown: Map.get(state, :shutdown_state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1167,6 +1199,24 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call(:shutdown, _from, %State{} = state) do
+    Enum.each(state.running, fn {issue_id, _running_entry} ->
+      terminate_running_issue(state, issue_id, false)
+    end)
+
+    next_state = %{
+      state
+      | running: %{},
+        shutdown_state: %{
+            reason: "requested",
+            at: DateTime.utc_now()
+          }
+    }
+
+    persist_runtime_state(next_state)
+    {:stop, :normal, :ok, next_state}
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1652,4 +1702,163 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  @impl true
+  def terminate(reason, %State{} = state) do
+    Enum.each(state.running, fn {issue_id, _running_entry} ->
+      terminate_running_issue(state, issue_id, false)
+    end)
+
+    final_state = %{
+      state
+      | running: %{},
+        shutdown_state: %{
+          reason: inspect(reason),
+          at: DateTime.utc_now()
+        }
+    }
+
+    persist_runtime_state(final_state)
+    :ok
+  end
+
+  defp load_persisted_runtime_state do
+    case RuntimeStateStore.load() do
+      {:ok, payload} when is_map(payload) ->
+        recovered_retry_attempts =
+          payload
+          |> Map.get("retry_attempts", %{})
+          |> Map.merge(recover_running_as_retry_attempts(Map.get(payload, "running", %{})))
+
+        %{
+          claimed:
+            payload
+            |> Map.get("claimed", [])
+            |> Kernel.++(Map.keys(Map.get(payload, "running", %{})))
+            |> hydrate_claimed(),
+          retry_attempts: hydrate_retry_attempts(recovered_retry_attempts),
+          tracker_status: hydrate_tracker_status(Map.get(payload, "tracker"))
+        }
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp persist_runtime_state(%State{} = state) do
+    snapshot = %{
+      "claimed" => MapSet.to_list(state.claimed),
+      "running" => serialize_running(state.running),
+      "retry_attempts" => serialize_retry_attempts(state.retry_attempts),
+      "tracker" => Map.get(state, :tracker_status),
+      "shutdown" => Map.get(state, :shutdown_state)
+    }
+
+    _ = RuntimeStateStore.persist(snapshot)
+    :ok
+  end
+
+  defp serialize_running(running) when is_map(running) do
+    Map.new(running, fn {issue_id, entry} ->
+      {issue_id,
+       %{
+         "identifier" => Map.get(entry, :identifier),
+         "worker_host" => Map.get(entry, :worker_host),
+         "workspace_path" => Map.get(entry, :workspace_path),
+         "retry_attempt" => Map.get(entry, :retry_attempt),
+         "issue" => serialize_issue(Map.get(entry, :issue)),
+         "session_id" => Map.get(entry, :session_id)
+       }}
+    end)
+  end
+
+  defp serialize_retry_attempts(retry_attempts) when is_map(retry_attempts) do
+    Map.new(retry_attempts, fn {issue_id, retry} ->
+      {issue_id,
+       %{
+         "attempt" => Map.get(retry, :attempt, 1),
+         "identifier" => Map.get(retry, :identifier),
+         "error" => Map.get(retry, :error),
+         "worker_host" => Map.get(retry, :worker_host),
+         "workspace_path" => Map.get(retry, :workspace_path)
+       }}
+    end)
+  end
+
+  defp serialize_issue(%Issue{} = issue) do
+    %{
+      "id" => issue.id,
+      "identifier" => issue.identifier,
+      "title" => issue.title,
+      "state" => issue.state
+    }
+  end
+
+  defp serialize_issue(_issue), do: nil
+
+  defp hydrate_claimed(claimed) when is_list(claimed), do: MapSet.new(claimed)
+  defp hydrate_claimed(_claimed), do: MapSet.new()
+
+  defp hydrate_retry_attempts(retry_attempts) when is_map(retry_attempts) do
+    Map.new(retry_attempts, fn {issue_id, retry} ->
+      retry_token = make_ref()
+      timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, 0)
+
+      {issue_id,
+       %{
+         attempt: Map.get(retry, "attempt", 1),
+         timer_ref: timer_ref,
+         retry_token: retry_token,
+         due_at_ms: System.monotonic_time(:millisecond),
+         identifier: Map.get(retry, "identifier"),
+         error: Map.get(retry, "error"),
+         worker_host: Map.get(retry, "worker_host"),
+         workspace_path: Map.get(retry, "workspace_path")
+       }}
+    end)
+  end
+
+  defp hydrate_retry_attempts(_retry_attempts), do: %{}
+
+  defp recover_running_as_retry_attempts(running) when is_map(running) do
+    Map.new(running, fn {issue_id, entry} ->
+      {issue_id,
+       %{
+         "attempt" => Map.get(entry, "retry_attempt") || 1,
+         "identifier" => Map.get(entry, "identifier") || get_in(entry, ["issue", "identifier"]),
+         "error" => "recovered after restart",
+         "worker_host" => Map.get(entry, "worker_host"),
+         "workspace_path" => Map.get(entry, "workspace_path")
+       }}
+    end)
+  end
+
+  defp recover_running_as_retry_attempts(_running), do: %{}
+
+  defp hydrate_tracker_status(%{} = tracker_status), do: tracker_status
+  defp hydrate_tracker_status(_tracker_status), do: tracker_status(:idle)
+
+  defp tracker_status(status, message \\ nil) do
+    %{status: status, message: message, at: DateTime.utc_now()}
+  end
+
+  defp put_tracker_status(%State{} = state, status, message) do
+    %{state | tracker_status: tracker_status(status, message)}
+  end
+
+  defp handle_tracker_fetch_failure(%State{} = state, {:linear_api_status, 429}) do
+    put_tracker_status(state, :rate_limited, "linear_api_status_429")
+  end
+
+  defp handle_tracker_fetch_failure(%State{} = state, reason) do
+    put_tracker_status(state, :error, inspect(reason))
+  end
+
+  defp next_poll_delay_ms(%State{poll_interval_ms: poll_interval_ms, tracker_status: %{status: :rate_limited}})
+       when is_integer(poll_interval_ms) do
+    min(poll_interval_ms * 3, 120_000)
+  end
+
+  defp next_poll_delay_ms(%State{poll_interval_ms: poll_interval_ms}) when is_integer(poll_interval_ms),
+    do: poll_interval_ms
 end

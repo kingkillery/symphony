@@ -44,6 +44,30 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
 
+    defmodule LifecycleStates do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+
+      embedded_schema do
+        field(:backlog, :string, default: "Backlog")
+        field(:todo, :string, default: "Todo")
+        field(:in_progress, :string, default: "In Progress")
+        field(:human_review, :string, default: "Human Review")
+        field(:merging, :string, default: "Merging")
+        field(:rework, :string, default: "Rework")
+        field(:done, :string, default: "Done")
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:backlog, :todo, :in_progress, :human_review, :merging, :rework, :done], empty_values: [])
+      end
+    end
+
     embedded_schema do
       field(:kind, :string)
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
@@ -52,6 +76,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      field(:workpad_marker, :string, default: "## Codex Workpad")
+      embeds_one(:lifecycle_states, LifecycleStates, on_replace: :update, defaults_to_struct: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -59,9 +85,10 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states, :workpad_marker],
         empty_values: []
       )
+      |> cast_embed(:lifecycle_states, with: &LifecycleStates.changeset/2)
     end
   end
 
@@ -261,6 +288,45 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Harness do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    defmodule Bootstrap do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+
+      embedded_schema do
+        field(:enabled, :boolean, default: true)
+        field(:mode, :string, default: "core")
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :mode], empty_values: [])
+        |> validate_inclusion(:mode, ["core", "detect", "full"])
+      end
+    end
+
+    embedded_schema do
+      embeds_one(:bootstrap, Bootstrap, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [])
+      |> cast_embed(:bootstrap, with: &Bootstrap.changeset/2)
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -271,6 +337,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:harness, Harness, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -363,6 +430,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:harness, with: &Harness.changeset/2)
   end
 
   defp finalize_settings(settings) do

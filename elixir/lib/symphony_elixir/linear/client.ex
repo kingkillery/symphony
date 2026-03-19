@@ -103,6 +103,88 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @issue_context_query """
+  query SymphonyLinearIssueContext($id: String!, $commentFirst: Int!, $stateFirst: Int!, $attachmentFirst: Int!, $relationFirst: Int!) {
+    issue(id: $id) {
+      id
+      identifier
+      title
+      description
+      priority
+      branchName
+      url
+      createdAt
+      updatedAt
+      state {
+        id
+        name
+      }
+      project {
+        id
+      }
+      assignee {
+        id
+      }
+      labels {
+        nodes {
+          name
+        }
+      }
+      inverseRelations(first: $relationFirst) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              name
+            }
+          }
+        }
+      }
+      relations(first: $relationFirst) {
+        nodes {
+          relatedIssue {
+            id
+            identifier
+            title
+            state {
+              name
+            }
+          }
+        }
+      }
+      comments(first: $commentFirst) {
+        nodes {
+          id
+          body
+          createdAt
+          updatedAt
+          resolvedAt
+        }
+      }
+      attachments(first: $attachmentFirst) {
+        nodes {
+          id
+          title
+          url
+          subtitle
+        }
+      }
+      team {
+        id
+        states(first: $stateFirst) {
+          nodes {
+            id
+            name
+            type
+          }
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -157,6 +239,21 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
+    end
+  end
+
+  @spec fetch_issue(String.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def fetch_issue(issue_id) when is_binary(issue_id) do
+    with {:ok, body} <-
+           graphql(@issue_context_query, %{
+             id: issue_id,
+             commentFirst: @issue_page_size,
+             stateFirst: @issue_page_size,
+             attachmentFirst: @issue_page_size,
+             relationFirst: @issue_page_size
+           }),
+         {:ok, issue} <- decode_issue_context_response(body) do
+      {:ok, issue}
     end
   end
 
@@ -437,6 +534,20 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
 
+  defp decode_issue_context_response(%{"data" => %{"issue" => issue}}) when is_map(issue) do
+    case normalize_issue_context(issue, nil) do
+      %Issue{} = normalized_issue -> {:ok, normalized_issue}
+      _ -> {:error, :linear_issue_not_found}
+    end
+  end
+
+  defp decode_issue_context_response(%{"data" => %{"issue" => nil}}), do: {:error, :linear_issue_not_found}
+
+  defp decode_issue_context_response(%{"errors" => errors}) when is_list(errors),
+    do: {:error, {:linear_graphql_errors, errors}}
+
+  defp decode_issue_context_response(_payload), do: {:error, :linear_unknown_payload}
+
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
     {:ok, end_cursor}
@@ -455,9 +566,12 @@ defmodule SymphonyElixir.Linear.Client do
       description: issue["description"],
       priority: parse_priority(issue["priority"]),
       state: get_in(issue, ["state", "name"]),
+      state_id: get_in(issue, ["state", "id"]),
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      team_id: get_in(issue, ["team", "id"]),
+      project_id: get_in(issue, ["project", "id"]),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
@@ -467,6 +581,24 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
+
+  defp normalize_issue_context(issue, assignee_filter) when is_map(issue) do
+    issue
+    |> normalize_issue(assignee_filter)
+    |> case do
+      %Issue{} = normalized_issue ->
+        %{
+          normalized_issue
+          | comments: extract_comments(issue),
+            attachments: extract_attachments(issue),
+            state_nodes: extract_state_nodes(issue),
+            related_issues: extract_related_issues(issue)
+        }
+
+      other ->
+        other
+    end
+  end
 
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
@@ -571,6 +703,75 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_blockers(_), do: []
+
+  defp extract_comments(%{"comments" => %{"nodes" => comments}}) when is_list(comments) do
+    Enum.map(comments, fn
+      %{} = comment ->
+        %{
+          id: comment["id"],
+          body: comment["body"],
+          created_at: parse_datetime(comment["createdAt"]),
+          updated_at: parse_datetime(comment["updatedAt"]),
+          resolved_at: parse_datetime(comment["resolvedAt"]),
+          resolved: not is_nil(comment["resolvedAt"])
+        }
+
+      _ ->
+        %{}
+    end)
+  end
+
+  defp extract_comments(_), do: []
+
+  defp extract_attachments(%{"attachments" => %{"nodes" => attachments}}) when is_list(attachments) do
+    Enum.map(attachments, fn
+      %{} = attachment ->
+        %{
+          id: attachment["id"],
+          title: attachment["title"],
+          url: attachment["url"],
+          subtitle: attachment["subtitle"]
+        }
+
+      _ ->
+        %{}
+    end)
+  end
+
+  defp extract_attachments(_), do: []
+
+  defp extract_state_nodes(%{"team" => %{"states" => %{"nodes" => states}}}) when is_list(states) do
+    Enum.map(states, fn
+      %{} = state ->
+        %{
+          id: state["id"],
+          name: state["name"],
+          type: state["type"]
+        }
+
+      _ ->
+        %{}
+    end)
+  end
+
+  defp extract_state_nodes(_), do: []
+
+  defp extract_related_issues(%{"relations" => %{"nodes" => relations}}) when is_list(relations) do
+    Enum.map(relations, fn
+      %{"relatedIssue" => %{} = related_issue} ->
+        %{
+          id: related_issue["id"],
+          identifier: related_issue["identifier"],
+          title: related_issue["title"],
+          state: get_in(related_issue, ["state", "name"])
+        }
+
+      _ ->
+        %{}
+    end)
+  end
+
+  defp extract_related_issues(_), do: []
 
   defp parse_datetime(nil), do: nil
 

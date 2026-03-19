@@ -1,0 +1,9 @@
+_build
+deps
+coverage
+log
+tmp
+.elixir_ls
+.mix
+.DS_Store
+node_modules

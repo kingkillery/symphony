@@ -3,11 +3,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{Config, Linear.Client, Tracker}
 
   @linear_graphql_tool "linear_graphql"
+  @linear_workflow_tool "linear_workflow"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  """
+  @linear_workflow_description """
+  Execute typed Symphony workflow actions against Linear for issue management, workpad updates, state transitions, and related issue creation.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -26,9 +30,37 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
 
+  @linear_workflow_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["action"],
+    "properties" => %{
+      "action" => %{
+        "type" => "string",
+        "enum" => ["get_issue_context", "upsert_workpad", "transition_issue", "attach_external_link", "create_issue", "create_followup_issue"]
+      },
+      "issueId" => %{"type" => "string"},
+      "currentIssueId" => %{"type" => "string"},
+      "body" => %{"type" => "string"},
+      "marker" => %{"type" => "string"},
+      "stateRole" => %{"type" => "string"},
+      "title" => %{"type" => "string"},
+      "url" => %{"type" => "string"},
+      "description" => %{"type" => ["string", "null"]},
+      "teamId" => %{"type" => ["string", "null"]},
+      "projectId" => %{"type" => ["string", "null"]},
+      "stateId" => %{"type" => ["string", "null"]},
+      "stateName" => %{"type" => ["string", "null"]},
+      "relationType" => %{"type" => ["string", "null"]}
+    }
+  }
+
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
+      @linear_workflow_tool ->
+        execute_linear_workflow(arguments, opts)
+
       @linear_graphql_tool ->
         execute_linear_graphql(arguments, opts)
 
@@ -45,6 +77,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @spec tool_specs() :: [map()]
   def tool_specs do
     [
+      %{
+        "name" => @linear_workflow_tool,
+        "description" => @linear_workflow_description,
+        "inputSchema" => @linear_workflow_input_schema
+      },
       %{
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
@@ -63,6 +100,22 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
+  end
+
+  defp execute_linear_workflow(arguments, opts) when is_map(arguments) do
+    tracker = Keyword.get(opts, :tracker, Tracker)
+
+    with {:ok, action} <- required_string(arguments, "action"),
+         {:ok, response} <- run_linear_workflow_action(action, arguments, tracker) do
+      dynamic_tool_response(true, encode_payload(%{"ok" => true, "action" => action, "result" => response}))
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_linear_workflow(_arguments, _opts) do
+    failure_response(tool_error_payload(:invalid_linear_workflow_arguments))
   end
 
   defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do
@@ -89,6 +142,69 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_linear_graphql_arguments(_arguments), do: {:error, :invalid_arguments}
+
+  defp run_linear_workflow_action("get_issue_context", arguments, tracker) do
+    with {:ok, issue_id} <- required_string(arguments, "issueId"),
+         {:ok, issue} <- tracker_call(tracker, :fetch_issue, [issue_id]) do
+      {:ok, issue_payload(issue)}
+    end
+  end
+
+  defp run_linear_workflow_action("upsert_workpad", arguments, tracker) do
+    with {:ok, issue_id} <- required_string(arguments, "issueId"),
+         {:ok, body} <- required_string(arguments, "body"),
+         marker <- optional_string(arguments, "marker") || Config.workpad_marker(),
+         {:ok, result} <- tracker_call(tracker, :upsert_workpad_comment, [issue_id, body, [marker: marker]]) do
+      {:ok, result}
+    end
+  end
+
+  defp run_linear_workflow_action("transition_issue", arguments, tracker) do
+    with {:ok, issue_id} <- required_string(arguments, "issueId"),
+         {:ok, state_role} <- required_string(arguments, "stateRole"),
+         :ok <- tracker_call(tracker, :transition_issue, [issue_id, state_role]) do
+      {:ok, %{"issueId" => issue_id, "stateRole" => state_role}}
+    end
+  end
+
+  defp run_linear_workflow_action("attach_external_link", arguments, tracker) do
+    with {:ok, issue_id} <- required_string(arguments, "issueId"),
+         {:ok, title} <- required_string(arguments, "title"),
+         {:ok, url} <- required_string(arguments, "url"),
+         :ok <- tracker_call(tracker, :attach_external_link, [issue_id, %{"title" => title, "url" => url}]) do
+      {:ok, %{"issueId" => issue_id, "title" => title, "url" => url}}
+    end
+  end
+
+  defp run_linear_workflow_action("create_issue", arguments, tracker) do
+    with {:ok, title} <- required_string(arguments, "title"),
+         {:ok, attrs} <- build_issue_create_attrs(arguments, title),
+         {:ok, created_issue} <- tracker_call(tracker, :create_issue, [attrs]) do
+      {:ok, created_issue}
+    end
+  end
+
+  defp run_linear_workflow_action("create_followup_issue", arguments, tracker) do
+    with {:ok, issue_id} <- required_string(arguments, "issueId"),
+         {:ok, title} <- required_string(arguments, "title"),
+         {:ok, issue} <- tracker_call(tracker, :fetch_issue, [issue_id]),
+         attrs <- %{
+           "current_issue_id" => issue_id,
+           "title" => title,
+           "description" => optional_string(arguments, "description"),
+           "team_id" => Map.get(issue, :team_id),
+           "project_id" => optional_string(arguments, "projectId") || Map.get(issue, :project_id),
+           "state_id" => optional_string(arguments, "stateId"),
+           "state_name" => optional_string(arguments, "stateName") || Config.lifecycle_state(:backlog),
+           "relation_type" => optional_string(arguments, "relationType") || "related"
+         },
+         {:ok, created_issue} <- tracker_call(tracker, :create_related_issue, [attrs]) do
+      {:ok, created_issue}
+    end
+  end
+
+  defp run_linear_workflow_action(action, _arguments, _tracker),
+    do: {:error, {:unsupported_linear_workflow_action, action}}
 
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
@@ -144,6 +260,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp encode_payload(payload), do: inspect(payload)
 
+  defp build_issue_create_attrs(arguments, title) do
+    attrs = %{
+      "title" => title,
+      "description" => optional_string(arguments, "description"),
+      "team_id" => optional_string(arguments, "teamId"),
+      "project_id" => optional_string(arguments, "projectId"),
+      "state_id" => optional_string(arguments, "stateId"),
+      "state_name" => optional_string(arguments, "stateName"),
+      "current_issue_id" => optional_string(arguments, "currentIssueId")
+    }
+
+    if attrs["team_id"] || attrs["current_issue_id"] do
+      {:ok, attrs}
+    else
+      {:error, :missing_issue_creation_context}
+    end
+  end
+
   defp tool_error_payload(:missing_query) do
     %{
       "error" => %{
@@ -164,6 +298,99 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_linear_workflow_arguments) do
+    %{
+      "error" => %{
+        "message" => "`linear_workflow` expects an object with an `action` field."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_creation_context) do
+    %{
+      "error" => %{
+        "message" =>
+          "`linear_workflow.create_issue` requires either `teamId` or `currentIssueId` so Symphony can resolve the target team."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_title) do
+    %{
+      "error" => %{
+        "message" => "`linear_workflow.create_issue` requires a non-empty `title`."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_issue_team_id) do
+    %{
+      "error" => %{
+        "message" => "Symphony could not resolve the Linear team for the new issue."
+      }
+    }
+  end
+
+  defp tool_error_payload({:missing_required_argument, field}) do
+    %{
+      "error" => %{
+        "message" => "`#{field}` is required and must be a non-empty string."
+      }
+    }
+  end
+
+  defp tool_error_payload({:unsupported_linear_workflow_action, action}) do
+    %{
+      "error" => %{
+        "message" => "Unsupported `linear_workflow` action: #{inspect(action)}."
+      }
+    }
+  end
+
+  defp tool_error_payload({:missing_tracker_callback, fun}) do
+    %{
+      "error" => %{
+        "message" =>
+          "The configured tracker does not implement the required callback for `linear_workflow`.",
+        "callback" => to_string(fun)
+      }
+    }
+  end
+
+  defp tool_error_payload({:unknown_lifecycle_role, state_role}) do
+    %{
+      "error" => %{
+        "message" => "Unknown lifecycle role for `linear_workflow.transition_issue`.",
+        "stateRole" => inspect(state_role)
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_external_link) do
+    %{
+      "error" => %{
+        "message" =>
+          "`linear_workflow.attach_external_link` requires non-empty `title` and `url` values."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_related_issue_title) do
+    %{
+      "error" => %{
+        "message" => "`linear_workflow.create_followup_issue` requires a non-empty `title`."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_related_issue_team_id) do
+    %{
+      "error" => %{
+        "message" => "Symphony could not resolve the Linear team for the follow-up issue."
       }
     }
   end
@@ -197,7 +424,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(reason) do
     %{
       "error" => %{
-        "message" => "Linear GraphQL tool execution failed.",
+        "message" => "Linear tool execution failed.",
         "reason" => inspect(reason)
       }
     }
@@ -205,5 +432,74 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])
+  end
+
+  defp required_string(arguments, key) do
+    case optional_string(arguments, key) do
+      nil -> {:error, {:missing_required_argument, key}}
+      value -> {:ok, value}
+    end
+  end
+
+  defp optional_string(arguments, key) do
+    case argument_value(arguments, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp argument_value(arguments, key) when is_map(arguments) and is_binary(key) do
+    cond do
+      Map.has_key?(arguments, key) ->
+        Map.get(arguments, key)
+
+      true ->
+        Enum.find_value(arguments, fn
+          {candidate_key, value} when is_atom(candidate_key) ->
+            if Atom.to_string(candidate_key) == key, do: value
+
+          _ ->
+            nil
+        end)
+    end
+  end
+
+  defp argument_value(_arguments, _key), do: nil
+
+  defp issue_payload(issue) when is_map(issue) do
+    %{
+      "id" => Map.get(issue, :id),
+      "identifier" => Map.get(issue, :identifier),
+      "title" => Map.get(issue, :title),
+      "description" => Map.get(issue, :description),
+      "state" => Map.get(issue, :state),
+      "stateId" => Map.get(issue, :state_id),
+      "branchName" => Map.get(issue, :branch_name),
+      "url" => Map.get(issue, :url),
+      "teamId" => Map.get(issue, :team_id),
+      "projectId" => Map.get(issue, :project_id),
+      "comments" => Map.get(issue, :comments, []),
+      "attachments" => Map.get(issue, :attachments, []),
+      "stateNodes" => Map.get(issue, :state_nodes, []),
+      "labels" => Map.get(issue, :labels, []),
+      "blockedBy" => Map.get(issue, :blocked_by, [])
+    }
+  end
+
+  defp tracker_call(tracker, fun, args) when is_atom(tracker) do
+    apply(tracker, fun, args)
+  end
+
+  defp tracker_call(tracker, fun, args) when is_map(tracker) do
+    case Map.get(tracker, fun) do
+      callback when is_function(callback, length(args)) -> apply(callback, args)
+      _ -> {:error, {:missing_tracker_callback, fun}}
+    end
   end
 end
