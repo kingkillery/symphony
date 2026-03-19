@@ -116,4 +116,5 @@ defmodule SymphonyElixir.AgentRunnerTest do
       end
     end
   end
+
 end

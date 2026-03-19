@@ -122,7 +122,7 @@ defmodule SymphonyElixir.ConfigTest do
       assert {:error, :missing_linear_project_slug} = Config.validate!()
     end
 
-    test "returns ok for memory tracker kind" do
+  test "returns ok for memory tracker kind" do
       write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
       assert :ok = Config.validate!()
     end
@@ -136,6 +136,16 @@ defmodule SymphonyElixir.ConfigTest do
 
       assert :ok = Config.validate!()
     end
+  end
+
+  test "returns configured workpad marker and lifecycle state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_workpad_marker: "## Workpad",
+      tracker_lifecycle_states: %{in_progress: "Doing"}
+    )
+
+    assert Config.workpad_marker() == "## Workpad"
+    assert Config.lifecycle_state(:in_progress) == "Doing"
   end
 
   describe "codex_runtime_settings/2" do

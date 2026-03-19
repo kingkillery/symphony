@@ -2,6 +2,7 @@
 tracker:
   kind: linear
   project_slug: "symphony-0c79b11b75ea"
+  workpad_marker: "## Codex Workpad"
   active_states:
     - Todo
     - In Progress
@@ -13,18 +14,38 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+  lifecycle_states:
+    backlog: "Backlog"
+    todo: "Todo"
+    in_progress: "In Progress"
+    human_review: "Human Review"
+    merging: "Merging"
+    rework: "Rework"
+    done: "Done"
 polling:
   interval_ms: 5000
 workspace:
-  root: ~/code/symphony-workspaces
+  root: $SYMPHONY_WORKSPACES_ROOT
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
-    if command -v mise >/dev/null 2>&1; then
+    git clone --depth 1 "${SOURCE_REPO_URL:-https://github.com/openai/symphony}" .
+    if [ -n "${SOURCE_REPO_REF:-}" ]; then
+      git fetch --depth 1 origin "${SOURCE_REPO_REF}"
+      git checkout FETCH_HEAD
+    fi
+    if [ -n "${SOURCE_REPO_SETUP_CMD:-}" ]; then
+      sh -lc "${SOURCE_REPO_SETUP_CMD}"
+    elif command -v mix >/dev/null 2>&1; then
+      cd elixir && mix deps.get
+    elif command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    if command -v mix >/dev/null 2>&1; then
+      cd elixir && mix workspace.before_remove
+    elif command -v mise >/dev/null 2>&1; then
+      cd elixir && mise exec -- mix workspace.before_remove
+    fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -34,6 +55,12 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+harness:
+  bootstrap:
+    enabled: true
+    mode: "core"
+server:
+  host: "0.0.0.0"
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
@@ -69,9 +96,9 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
-## Prerequisite: Linear MCP or `linear_graphql` tool is available
+## Prerequisite: `linear_workflow` and `linear_graphql` tools are available
 
-The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
+Symphony injects typed workflow actions through `linear_workflow` and keeps `linear_graphql` as a fallback for unsupported Linear operations. Use `linear_workflow` for normal issue management, workpad maintenance, state transitions, PR linking, and follow-up issue creation. Use `linear_graphql` only when the typed tool does not support the required operation.
 
 ## Default posture
 

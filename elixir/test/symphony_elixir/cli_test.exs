@@ -240,4 +240,57 @@ defmodule SymphonyElixir.CLITest do
     assert :ok = CLI.evaluate([@ack_flag, "--port", "3000", "--port", "5000"], deps)
     assert_received {:port_set, 5000}
   end
+
+  test "issue create returns structured json for agent callers" do
+    parent = self()
+    expanded_workflow = Path.expand("WORKFLOW.md")
+
+    deps = %{
+      file_regular?: fn path -> path == expanded_workflow end,
+      set_workflow_file_path: fn path ->
+        send(parent, {:workflow_set, path})
+        :ok
+      end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end,
+      create_issue: fn attrs ->
+        send(parent, {:create_issue, attrs})
+        {:ok, %{"id" => "issue-1", "identifier" => "MT-1"}}
+      end
+    }
+
+    assert {:ok, output} =
+             CLI.evaluate(
+               ["issue", "create", @ack_flag, "--title", "New issue", "--team-id", "team-1"],
+               deps
+             )
+
+    assert_received {:workflow_set, ^expanded_workflow}
+    assert_received {:create_issue, %{"title" => "New issue", "team_id" => "team-1"} = attrs}
+    assert attrs["current_issue_id"] == nil
+    assert Jason.decode!(output)["issue"]["identifier"] == "MT-1"
+  end
+
+  test "issue create accepts current issue context without explicit team id" do
+    deps = %{
+      file_regular?: fn _path -> true end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end,
+      create_issue: fn attrs ->
+        assert attrs["current_issue_id"] == "issue-1"
+        {:ok, %{"id" => "issue-2", "identifier" => "MT-2"}}
+      end
+    }
+
+    assert {:ok, output} =
+             CLI.evaluate(
+               ["issue", "create", @ack_flag, "--title", "Follow on", "--current-issue-id", "issue-1"],
+               deps
+             )
+
+    assert Jason.decode!(output)["issue"]["identifier"] == "MT-2"
+  end
 end

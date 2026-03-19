@@ -21,6 +21,31 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     send(pid, :stop)
   end
 
+  test "orchestrator snapshot includes tracker and shutdown observability" do
+    orchestrator_name = Module.concat(__MODULE__, :ObservabilitySnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    now = DateTime.utc_now()
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | tracker_status: %{status: :rate_limited, message: "linear_api_status_429", at: now},
+          shutdown_state: %{reason: "maintenance", at: now}
+      }
+    end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.tracker == %{status: :rate_limited, message: "linear_api_status_429", at: now}
+    assert snapshot.shutdown == %{reason: "maintenance", at: now}
+  end
+
   test "orchestrator snapshot reflects last codex update and session id" do
     issue_id = "issue-snapshot"
 

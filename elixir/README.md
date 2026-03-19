@@ -20,8 +20,9 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+During app-server sessions, Symphony serves both a typed `linear_workflow` tool and the fallback
+`linear_graphql` tool so repo-local skills can manage issues, workpads, transitions, attachments,
+and issue creation without dropping down to raw GraphQL unless needed.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -42,7 +43,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
-6. Follow the instructions below to install the required runtime dependencies and start the service.
+6. Set `SOURCE_REPO_URL` to the GitHub repository Symphony should clone into each issue workspace.
+7. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
 
@@ -64,6 +66,57 @@ mise exec -- mix setup
 mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
+
+## Docker
+
+Build the self-contained image from the Elixir implementation directory:
+
+```bash
+cd symphony/elixir
+docker build -t symphony-elixir:local .
+```
+
+Run it with your Linear token, Codex auth mount, and persistent logs/workspaces:
+
+```bash
+docker run --rm \
+  -p 4000:4000 \
+  -e LINEAR_API_KEY="$LINEAR_API_KEY" \
+  -e SOURCE_REPO_URL="https://github.com/your-org/your-repo" \
+  -e SYMPHONY_PORT=4000 \
+  -e SYMPHONY_WORKSPACES_ROOT=/var/lib/symphony/workspaces \
+  -v "$HOME/.codex:/root/.codex" \
+  -v "$(pwd)/WORKFLOW.md:/opt/symphony/runtime/WORKFLOW.md:ro" \
+  -v symphony-logs:/var/log/symphony \
+  -v symphony-workspaces:/var/lib/symphony/workspaces \
+  symphony-elixir:local
+```
+
+The image contains:
+
+- the built `symphony` escript
+- Elixir/Erlang runtime tools
+- `git` and `openssh-client` for workspace bootstrap
+- Node.js and the `@openai/codex` CLI package for `codex app-server`
+
+There is also a checked-in Compose file:
+
+```bash
+cd symphony/elixir
+export LINEAR_API_KEY=...
+export SOURCE_REPO_URL=https://github.com/your-org/your-repo
+docker compose up --build
+```
+
+Container runtime notes:
+
+- The container entrypoint automatically supplies Symphony's required guardrail acknowledgement flag.
+- `SYMPHONY_WORKFLOW_FILE` defaults to `/opt/symphony/WORKFLOW.md` in the image, and the Compose file overrides it to the mounted `./WORKFLOW.md`.
+- Mount `~/.codex` into `/root/.codex` so the bundled Codex CLI can reuse your existing auth.
+- The checked-in `WORKFLOW.md` now uses `$SYMPHONY_WORKSPACES_ROOT`, so container and non-container runs can share the same workflow contract.
+- `SOURCE_REPO_URL` controls which GitHub repo is cloned into fresh workspaces.
+- `SOURCE_REPO_REF` optionally pins bootstrap to a branch, tag, or commit.
+- `SOURCE_REPO_SETUP_CMD` optionally runs repo-specific setup after clone; if unset, the default workflow falls back to Elixir-oriented setup only when it detects that toolchain.
 
 ## Configuration
 
@@ -125,6 +178,7 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- The checked-in workflow already does this generically with `SOURCE_REPO_URL`, so the same image can target any GitHub repo on your machine without changing Symphony itself.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
@@ -141,9 +195,34 @@ workspace:
 hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
+    if [ -n "$SOURCE_REPO_REF" ]; then
+      git fetch --depth 1 origin "$SOURCE_REPO_REF"
+      git checkout FETCH_HEAD
+    fi
 codex:
   command: "$CODEX_BIN app-server --model gpt-5.3-codex"
 ```
+
+## Creating issues from Codex CLI or Claude Code
+
+Symphony now supports Linear issue creation in two ways:
+
+- Inside a running Symphony turn, use the typed `linear_workflow` tool with action `create_issue`.
+- Outside a run, call the escript directly so Codex CLI or Claude Code can create issues over the shell:
+
+```bash
+cd symphony/elixir
+./bin/symphony issue create \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --workflow ./WORKFLOW.md \
+  --title "Investigate flaky sync in repo bootstrap" \
+  --team-id "<linear-team-id>" \
+  --project-id "<linear-project-id>" \
+  --state-name "Backlog"
+```
+
+The command prints structured JSON with the created issue metadata, which makes it suitable for
+agentic CLI workflows.
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the

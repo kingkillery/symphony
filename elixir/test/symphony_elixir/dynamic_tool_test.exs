@@ -3,23 +3,21 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
-  test "tool_specs advertises the linear_graphql input contract" do
-    assert [
-             %{
-               "description" => description,
-               "inputSchema" => %{
-                 "properties" => %{
-                   "query" => _,
-                   "variables" => _
-                 },
-                 "required" => ["query"],
-                 "type" => "object"
-               },
-               "name" => "linear_graphql"
-             }
-           ] = DynamicTool.tool_specs()
+  test "tool_specs advertises the linear tool contracts" do
+    specs = DynamicTool.tool_specs()
 
-    assert description =~ "Linear"
+    assert Enum.any?(specs, fn
+             %{"name" => "linear_graphql"} -> true
+             _ -> false
+           end)
+
+    assert Enum.any?(specs, fn
+             %{"name" => "linear_workflow", "description" => description} ->
+               description =~ "workflow"
+
+             _ ->
+               false
+           end)
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -30,7 +28,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_workflow", "linear_graphql"]
              }
            }
 
@@ -290,7 +288,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
-               "message" => "Linear GraphQL tool execution failed.",
+               "message" => "Linear tool execution failed.",
                "reason" => ":boom"
              }
            }
@@ -306,5 +304,124 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == true
     assert response["output"] == ":ok"
+  end
+
+  test "linear_workflow gets issue context through the tracker" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{"action" => "get_issue_context", "issueId" => "issue-1"},
+        tracker: %{
+          fetch_issue: fn "issue-1" -> {:ok, %Issue{id: "issue-1", identifier: "MT-1", state: "Todo"}} end
+        }
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["result"]["identifier"] == "MT-1"
+  end
+
+  test "linear_workflow upserts workpad through the tracker" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{"action" => "upsert_workpad", "issueId" => "issue-1", "body" => "## Codex Workpad\n\nhello"},
+        tracker: %{
+          upsert_workpad_comment: fn "issue-1", _body, _opts -> {:ok, %{id: "comment-1", created: true}} end
+        }
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["result"]["id"] == "comment-1"
+  end
+
+  test "linear_workflow transitions issues through lifecycle roles" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{"action" => "transition_issue", "issueId" => "issue-1", "stateRole" => "in_progress"},
+        tracker: %{
+          transition_issue: fn "issue-1", "in_progress" -> :ok end
+        }
+      )
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"])["result"] == %{
+             "issueId" => "issue-1",
+             "stateRole" => "in_progress"
+           }
+  end
+
+  test "linear_workflow creates a standalone issue through the tracker" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{
+          "action" => "create_issue",
+          "title" => "New issue",
+          "teamId" => "team-1",
+          "projectId" => "project-1",
+          "stateName" => "Backlog"
+        },
+        tracker: %{
+          create_issue: fn attrs ->
+            assert attrs["title"] == "New issue"
+            assert attrs["team_id"] == "team-1"
+            assert attrs["project_id"] == "project-1"
+            assert attrs["state_name"] == "Backlog"
+            {:ok, %{"id" => "issue-2", "identifier" => "MT-2"}}
+          end
+        }
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["result"]["identifier"] == "MT-2"
+  end
+
+  test "linear_workflow creates a follow-up issue from current issue context" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{
+          "action" => "create_followup_issue",
+          "issueId" => "issue-1",
+          "title" => "Follow up",
+          "description" => "needs separate scope"
+        },
+        tracker: %{
+          fetch_issue: fn "issue-1" ->
+            {:ok, %Issue{id: "issue-1", team_id: "team-1", project_id: "project-1"}}
+          end,
+          create_related_issue: fn attrs ->
+            assert attrs["current_issue_id"] == "issue-1"
+            assert attrs["team_id"] == "team-1"
+            assert attrs["project_id"] == "project-1"
+            {:ok, %{"id" => "issue-2", "identifier" => "MT-2"}}
+          end
+        }
+      )
+
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["result"]["identifier"] == "MT-2"
+  end
+
+  test "linear_workflow formats lifecycle role failures" do
+    response =
+      DynamicTool.execute(
+        "linear_workflow",
+        %{"action" => "transition_issue", "issueId" => "issue-1", "stateRole" => "bad_role"},
+        tracker: %{
+          transition_issue: fn "issue-1", "bad_role" -> {:error, {:unknown_lifecycle_role, "bad_role"}} end
+        }
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Unknown lifecycle role for `linear_workflow.transition_issue`.",
+               "stateRole" => "\"bad_role\""
+             }
+           }
   end
 end

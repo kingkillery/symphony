@@ -1,0 +1,28 @@
+services:
+  symphony:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: symphony-elixir:local
+    restart: unless-stopped
+    ports:
+      - "${SYMPHONY_PORT:-4000}:${SYMPHONY_PORT:-4000}"
+    environment:
+      LINEAR_API_KEY: "${LINEAR_API_KEY:?Set LINEAR_API_KEY before starting docker compose.}"
+      SYMPHONY_PORT: "${SYMPHONY_PORT:-4000}"
+      SYMPHONY_LOGS_ROOT: /var/log/symphony
+      SYMPHONY_WORKSPACES_ROOT: /var/lib/symphony/workspaces
+      SYMPHONY_WORKFLOW_FILE: /opt/symphony/runtime/WORKFLOW.md
+      SOURCE_REPO_URL: "${SOURCE_REPO_URL:-https://github.com/openai/symphony}"
+      SOURCE_REPO_REF: "${SOURCE_REPO_REF:-}"
+      SOURCE_REPO_SETUP_CMD: "${SOURCE_REPO_SETUP_CMD:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - ./WORKFLOW.md:/opt/symphony/runtime/WORKFLOW.md:ro
+      - symphony-logs:/var/log/symphony
+      - symphony-workspaces:/var/lib/symphony/workspaces
+      - ${HOME}/.codex:/root/.codex
+
+volumes:
+  symphony-logs:
+  symphony-workspaces:

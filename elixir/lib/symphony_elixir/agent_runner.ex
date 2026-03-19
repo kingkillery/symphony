@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, HarnessBootstrap, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -50,7 +50,10 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with {:ok, bootstrap_result} <- HarnessBootstrap.ensure(workspace),
+               :ok <- maybe_log_bootstrap_result(issue, bootstrap_result),
+               :ok <- maybe_record_bootstrap_workpad(issue, bootstrap_result),
+               :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -224,5 +227,71 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
+  end
+
+  defp maybe_log_bootstrap_result(%Issue{id: issue_id}, %{changed: changed})
+       when is_binary(issue_id) and is_list(changed) do
+    Logger.info("Harness bootstrap issue_id=#{issue_id} changed=#{inspect(changed)}")
+    :ok
+  end
+
+  defp maybe_log_bootstrap_result(_issue, _bootstrap_result), do: :ok
+
+  defp maybe_record_bootstrap_workpad(%Issue{id: issue_id}, %{changed: changed} = bootstrap_result)
+       when is_binary(issue_id) and is_list(changed) do
+    if changed == [] do
+      :ok
+    else
+      with {:ok, fetched_issue} <- Tracker.fetch_issue(issue_id),
+           false <- workpad_exists?(fetched_issue),
+           body <- bootstrap_workpad_body(bootstrap_result),
+           {:ok, _comment} <-
+             Tracker.upsert_workpad_comment(issue_id, body, marker: Config.workpad_marker()) do
+        :ok
+      else
+        true ->
+          :ok
+
+        {:error, reason} ->
+          Logger.debug(
+            "Skipping bootstrap workpad note for #{issue_context(%Issue{id: issue_id, identifier: issue_id})}: #{inspect(reason)}"
+          )
+
+          :ok
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp maybe_record_bootstrap_workpad(_issue, _bootstrap_result), do: :ok
+
+  defp workpad_exists?(%Issue{comments: comments}) when is_list(comments) do
+    marker = Config.workpad_marker()
+
+    Enum.any?(comments, fn
+      %{body: body} when is_binary(body) -> String.contains?(body, marker)
+      _ -> false
+    end)
+  end
+
+  defp workpad_exists?(_issue), do: false
+
+  defp bootstrap_workpad_body(%{changed: changed, mode: mode}) do
+    changed_lines =
+      changed
+      |> Enum.map(&"- created `#{&1}`")
+      |> Enum.join("\n")
+
+    """
+    #{Config.workpad_marker()}
+
+    Bootstrap status:
+    - mode: #{mode || "core"}
+    #{changed_lines}
+
+    This note was created automatically by Symphony before the first agent turn because the repository was missing core harness files.
+    """
   end
 end

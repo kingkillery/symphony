@@ -106,9 +106,13 @@ defmodule SymphonyElixir.Config.SchemaTest do
   test "parse handles empty config with all defaults" do
     assert {:ok, settings} = Schema.parse(%{})
     assert settings.tracker.kind == nil
+    assert settings.tracker.workpad_marker == "## Codex Workpad"
+    assert settings.tracker.lifecycle_states.in_progress == "In Progress"
     assert settings.polling.interval_ms == 30_000
     assert settings.agent.max_concurrent_agents == 10
     assert settings.codex.command == "codex app-server"
+    assert settings.harness.bootstrap.enabled == true
+    assert settings.harness.bootstrap.mode == "core"
   end
 
   test "parse drops nil values before applying changeset" do
@@ -120,6 +124,27 @@ defmodule SymphonyElixir.Config.SchemaTest do
 
     assert settings.tracker.kind == "linear"
     assert settings.polling.interval_ms == 30_000
+  end
+
+  test "parse accepts lifecycle state overrides" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "tracker" => %{
+                 "lifecycle_states" => %{"human_review" => "QA Review", "done" => "Completed"}
+               }
+             })
+
+    assert settings.tracker.lifecycle_states.human_review == "QA Review"
+    assert settings.tracker.lifecycle_states.done == "Completed"
+  end
+
+  test "parse rejects invalid harness bootstrap mode" do
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{
+               "harness" => %{"bootstrap" => %{"mode" => "broken"}}
+             })
+
+    assert message =~ "harness"
   end
 
   # -- max_concurrent_agents_by_state validation --
