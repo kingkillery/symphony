@@ -1,0 +1,29 @@
+.symphony-dashboard {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+	padding: 16px;
+}
+
+.symphony-dashboard__section {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	padding: 12px;
+	background: var(--background-secondary);
+}
+
+.symphony-dashboard__title {
+	margin: 0 0 8px;
+	font-size: 1.05rem;
+}
+
+.symphony-dashboard__meta {
+	margin: 0;
+	color: var(--text-muted);
+	font-size: 0.9rem;
+}
+
+.symphony-dashboard__list {
+	margin: 8px 0 0;
+	padding-left: 18px;
+}
