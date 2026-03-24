@@ -1,5 +1,5 @@
 app = "symphony-pm"
-primary_region = "den"
+primary_region = "dfw"
 
 [build]
   dockerfile = "Dockerfile"
@@ -8,7 +8,7 @@ primary_region = "den"
   SYMPHONY_PORT = "4000"
   SYMPHONY_LOGS_ROOT = "/data/log"
   SYMPHONY_WORKSPACES_ROOT = "/data/workspaces"
-  SYMPHONY_WORKFLOW_FILE = "/opt/symphony/runtime/WORKFLOW.md"
+  SYMPHONY_WORKFLOW_FILE = "/opt/symphony/WORKFLOW.md"
   SYMPHONY_CODEX_HOME = "/data/codex-home"
   SYMPHONY_HOST_CODEX_DIR = "/opt/symphony/host-codex"
   SOURCE_REPO_URL = "https://github.com/kingkillery/symphony"
