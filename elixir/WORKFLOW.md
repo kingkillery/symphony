@@ -1,7 +1,7 @@
 ---
 tracker:
   kind: linear
-  project_slug: "symphony-0c79b11b75ea"
+  project_slug: "interconnection-agent-168eb6d2d969"
   workpad_marker: "## Codex Workpad"
   active_states:
     - Todo
@@ -27,17 +27,22 @@ polling:
 workspace:
   root: $SYMPHONY_WORKSPACES_ROOT
 hooks:
+  timeout_ms: 300000
   after_create: |
-    git clone --depth 1 "${SOURCE_REPO_URL:-https://github.com/openai/symphony}" .
+    if [ -d "${SOURCE_REPO_URL:-}" ]; then
+      git clone "${SOURCE_REPO_URL}" .
+    else
+      git clone --depth 1 "${SOURCE_REPO_URL:-https://github.com/openai/symphony}" .
+    fi
     if [ -n "${SOURCE_REPO_REF:-}" ]; then
       git fetch --depth 1 origin "${SOURCE_REPO_REF}"
       git checkout FETCH_HEAD
     fi
     if [ -n "${SOURCE_REPO_SETUP_CMD:-}" ]; then
       sh -lc "${SOURCE_REPO_SETUP_CMD}"
-    elif command -v mix >/dev/null 2>&1; then
+    elif [ -d elixir ] && command -v mix >/dev/null 2>&1; then
       cd elixir && mix deps.get
-    elif command -v mise >/dev/null 2>&1; then
+    elif [ -d elixir ] && command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
   before_remove: |
@@ -47,12 +52,13 @@ hooks:
       cd elixir && mise exec -- mix workspace.before_remove
     fi
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 1
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  read_timeout_ms: 30000
   turn_sandbox_policy:
     type: workspaceWrite
 harness:

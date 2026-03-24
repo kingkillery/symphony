@@ -22,6 +22,7 @@ services:
       - symphony-logs:/var/log/symphony
       - symphony-workspaces:/var/lib/symphony/workspaces
       - ${HOME}/.codex:/root/.codex
+      - ${SOURCE_REPO_HOST_PATH:?Set SOURCE_REPO_HOST_PATH before starting docker compose.}:/host-source-repo:ro
 
 volumes:
   symphony-logs:

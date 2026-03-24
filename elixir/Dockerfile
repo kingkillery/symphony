@@ -50,7 +50,8 @@ COPY --from=build /app/bin/symphony /usr/local/bin/symphony
 COPY --from=build /app/WORKFLOW.md /opt/symphony/WORKFLOW.md
 COPY docker/entrypoint.sh /usr/local/bin/symphony-entrypoint
 
-RUN chmod +x /usr/local/bin/symphony /usr/local/bin/symphony-entrypoint && \
+RUN sed -i 's/\r$//' /usr/local/bin/symphony-entrypoint && \
+    chmod +x /usr/local/bin/symphony /usr/local/bin/symphony-entrypoint && \
     mkdir -p /var/log/symphony /var/lib/symphony/workspaces /root/.codex
 
 VOLUME ["/var/log/symphony", "/var/lib/symphony/workspaces", "/root/.codex"]
