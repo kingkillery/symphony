@@ -18,6 +18,28 @@ Symphony works best in codebases that have adopted
 [harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
 moving from managing coding agents to managing work that needs to get done.
 
+### Obsidian plugin connection
+
+The Obsidian plugin scaffold lives at:
+
+`C:\dev\Desktop-Projects\Obsidian Plugins\plugins\symphony`
+
+Use that folder as the active plugin workspace when iterating on the Obsidian integration. The
+fastest workflow is to keep this repo as the specification/source-of-truth and edit the plugin
+workspace directly, or wire a symlink/junction from this repo into that directory if you want a
+single working copy.
+
+Suggested Windows junction command:
+
+```powershell
+New-Item -ItemType Junction `
+  -Path "C:\dev\Desktop-Projects\Symphony-PM\symphony\obsidian-plugin" `
+  -Target "C:\dev\Desktop-Projects\Obsidian Plugins\plugins\symphony"
+```
+
+After that, you can open `C:\dev\Desktop-Projects\Symphony-PM\symphony\obsidian-plugin` as the
+plugin mirror without having to remember the longer path.
+
 ### Option 1. Make your own
 
 Tell your favorite coding agent to build Symphony in a programming language of your choice:
