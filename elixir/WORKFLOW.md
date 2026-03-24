@@ -52,7 +52,7 @@ hooks:
       cd elixir && mise exec -- mix workspace.before_remove
     fi
 agent:
-  max_concurrent_agents: 1
+  max_concurrent_agents: 15
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
