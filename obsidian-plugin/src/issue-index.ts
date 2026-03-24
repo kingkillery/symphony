@@ -1,6 +1,7 @@
 import type { CachedMetadata, FrontMatterCache, TFile, Vault } from "obsidian";
 import { normalizePath } from "obsidian";
 import type { SymphonySettings } from "./settings";
+import { normalizeSymphonyIssueState } from "./task-plugin-compat";
 
 export interface IndexedIssue {
 	path: string;
@@ -86,11 +87,7 @@ function readTitle(file: TFile, frontmatter: FrontMatterCache | null): string {
 }
 
 function readState(frontmatter: FrontMatterCache | null): string {
-	return (
-		readString(frontmatter?.state) ||
-		readString(frontmatter?.status) ||
-		"Todo"
-	);
+	return normalizeSymphonyIssueState(readString(frontmatter?.state) || readString(frontmatter?.status)) || "Todo";
 }
 
 function readProjectRelated(

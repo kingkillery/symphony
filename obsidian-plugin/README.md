@@ -86,6 +86,11 @@ The plugin now exposes command-palette actions for vault-native task intake:
 - `Symphony: Run current issue`
 - `Symphony: Stop current issue`
 
+New Symphony tasks now prompt for an implementation path and stamp it into the note as
+`implementation_path`, with a matching `## Implementation` section seeded to `/implementation`
+by default. Assigning an existing note to Symphony also backfills `implementation_path` and
+adds the implementation section when it is missing.
+
 Use `Symphony instance ID` in plugin settings to stamp created or assigned notes with the
 vault's Symphony instance identifier.
 

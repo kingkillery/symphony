@@ -27,6 +27,7 @@ import {
 	mergeSettingsWithWorkflow,
 	type WorkflowConfigSnapshot,
 } from "./workflow-config";
+import { syncTaskPluginMetadata, TASK_PLUGIN_TAG, issueStateToTaskPluginStatus, normalizeSymphonyIssueState } from "./task-plugin-compat";
 import {
 	SYMPHONY_DASHBOARD_VIEW_TYPE,
 	SymphonyDashboardView,
@@ -484,9 +485,15 @@ export default class SymphonyPlugin extends Plugin {
 			return;
 		}
 
+		const implementationPathInput = window.prompt("Implementation path", "/implementation");
+		if (implementationPathInput === null) {
+			return;
+		}
+
+		const implementationPath = this.normalizeImplementationPath(implementationPathInput);
 		await this.ensureVaultFolder(effective.issueFolderPath);
 		const filePath = await this.getAvailableIssuePath(effective.issueFolderPath, title);
-		const file = await this.app.vault.create(filePath, this.buildSymphonyTaskContent(title));
+		const file = await this.app.vault.create(filePath, this.buildSymphonyTaskContent(title, implementationPath));
 		await this.app.workspace.getLeaf(true).openFile(file);
 		await this.refreshIssueIndex();
 		new Notice(`Created Symphony task ${title}.`, 5000);
@@ -496,6 +503,7 @@ export default class SymphonyPlugin extends Plugin {
 		const effective = this.getEffectiveSettings();
 		const originalPath = file.path;
 		let moved = false;
+		let implementationPath = "/implementation";
 
 		await this.ensureVaultFolder(effective.issueFolderPath);
 		if (!this.isIssueFilePath(file.path, effective.issueFolderPath)) {
@@ -516,11 +524,16 @@ export default class SymphonyPlugin extends Plugin {
 			if (instanceId) {
 				frontmatter.symphony_instance_id = instanceId;
 			}
+			const existingImplementationPath =
+				typeof frontmatter.implementation_path === "string" ? frontmatter.implementation_path : "";
+			implementationPath = this.normalizeImplementationPath(existingImplementationPath);
+			frontmatter.implementation_path = implementationPath;
 			frontmatter.symphony_assigned_at = new Date().toISOString();
 			if (moved && typeof frontmatter.symphony_source_path !== "string") {
 				frontmatter.symphony_source_path = originalPath;
 			}
 		});
+		await this.ensureImplementationSection(file, implementationPath);
 
 		await this.app.workspace.getLeaf(true).openFile(file);
 		await this.refreshIssueIndex();
@@ -760,19 +773,27 @@ export default class SymphonyPlugin extends Plugin {
 		mutate: (frontmatter: Record<string, unknown>) => void,
 	): Promise<void> {
 		await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-			mutate(frontmatter as Record<string, unknown>);
+			const mutableFrontmatter = frontmatter as Record<string, unknown>;
+			mutate(mutableFrontmatter);
+			syncTaskPluginMetadata(mutableFrontmatter, this.readIssueState(mutableFrontmatter));
 		});
 	}
 
-	private buildSymphonyTaskContent(title: string): string {
+	private buildSymphonyTaskContent(title: string, implementationPath: string): string {
 		const marker = this.getEffectiveSettings().projectRelatedMarker;
 		const now = new Date().toISOString();
 		const lines = [
 			"---",
 			`title: ${this.toYamlString(title)}`,
 			"state: Todo",
-			`${marker}: true`,
+			`status: ${this.toYamlString(issueStateToTaskPluginStatus("Todo"))}`,
+			"tags:",
+			`  - ${this.toYamlString(TASK_PLUGIN_TAG)}`,
+			`implementation_path: ${this.toYamlString(implementationPath)}`,
 			`symphony_created_at: ${this.toYamlString(now)}`,
+			`dateCreated: ${this.toYamlString(now)}`,
+			`dateModified: ${this.toYamlString(now)}`,
+			`${marker}: true`,
 		];
 
 		const instanceId = this.settings.symphonyInstanceId.trim();
@@ -780,7 +801,22 @@ export default class SymphonyPlugin extends Plugin {
 			lines.push(`symphony_instance_id: ${this.toYamlString(instanceId)}`);
 		}
 
-		lines.push("---", "", `# ${title}`, "", "## Objective", "", "## Context", "", "## Definition of done", "");
+		lines.push(
+			"---",
+			"",
+			`# ${title}`,
+			"",
+			"## Objective",
+			"",
+			"## Context",
+			"",
+			"## Implementation",
+			"",
+			`Path: ${implementationPath}`,
+			"",
+			"## Definition of done",
+			"",
+		);
 		return lines.join("\n");
 	}
 
@@ -814,6 +850,40 @@ export default class SymphonyPlugin extends Plugin {
 		}
 	}
 
+	private async ensureImplementationSection(file: TFile, implementationPath: string): Promise<void> {
+		const content = await this.app.vault.read(file);
+		const normalizedPathLine = `Path: ${implementationPath}`;
+		const implementationSection = this.findImplementationSection(content);
+
+		if (implementationSection) {
+			const sectionContent = content.slice(implementationSection.start, implementationSection.end);
+			let updatedSection = sectionContent;
+
+			if (/^Path:\s+.*$/im.test(sectionContent)) {
+				updatedSection = sectionContent.replace(/^Path:\s+.*$/im, normalizedPathLine);
+			} else {
+				updatedSection = sectionContent.replace(
+					/^## Implementation\s*$/im,
+					`## Implementation\n\n${normalizedPathLine}`,
+				);
+			}
+
+			if (updatedSection !== sectionContent) {
+				const updatedContent =
+					content.slice(0, implementationSection.start) +
+					updatedSection +
+					content.slice(implementationSection.end);
+				await this.app.vault.modify(file, updatedContent);
+			}
+			return;
+		}
+
+		const trimmed = content.replace(/\s*$/, "");
+		const separator = trimmed.length > 0 ? "\n\n" : "";
+		const updated = `${trimmed}${separator}## Implementation\n\n${normalizedPathLine}\n`;
+		await this.app.vault.modify(file, updated);
+	}
+
 	private isIssueFilePath(filePath: string, issueFolderPath: string): boolean {
 		const normalizedFilePath = normalizePath(filePath);
 		const normalizedIssueFolder = normalizePath(issueFolderPath);
@@ -825,9 +895,9 @@ export default class SymphonyPlugin extends Plugin {
 	}
 
 	private readExplicitIssueState(frontmatter: Record<string, unknown>): string {
-		const state = typeof frontmatter.state === "string" ? frontmatter.state.trim() : "";
-		const status = typeof frontmatter.status === "string" ? frontmatter.status.trim() : "";
-		return state || status || "";
+		const rawState = typeof frontmatter.state === "string" ? frontmatter.state.trim() : "";
+		const rawStatus = typeof frontmatter.status === "string" ? frontmatter.status.trim() : "";
+		return normalizeSymphonyIssueState(rawState || rawStatus);
 	}
 
 	private readIssueState(frontmatter: Record<string, unknown>): string {
@@ -844,6 +914,34 @@ export default class SymphonyPlugin extends Plugin {
 
 	private toYamlString(value: string): string {
 		return JSON.stringify(value);
+	}
+
+	private normalizeImplementationPath(value: string): string {
+		const trimmed = value.trim();
+		if (!trimmed) {
+			return "/implementation";
+		}
+
+		const normalized = trimmed.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+		return normalized.startsWith("/") ? normalized : `/${normalized}`;
+	}
+
+	private findImplementationSection(content: string): { start: number; end: number } | null {
+		const headingPattern = /^##\s+Implementation\s*$/im;
+		const match = headingPattern.exec(content);
+		if (!match || match.index === undefined) {
+			return null;
+		}
+
+		const start = match.index;
+		const afterHeadingIndex = start + match[0].length;
+		const remainingContent = content.slice(afterHeadingIndex);
+		const nextHeadingMatch = /^\s*##\s+/m.exec(remainingContent);
+		const end = nextHeadingMatch && nextHeadingMatch.index !== undefined
+			? afterHeadingIndex + nextHeadingMatch.index
+			: content.length;
+
+		return { start, end };
 	}
 
 	private async activateDashboardView(): Promise<void> {
