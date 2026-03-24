@@ -2,6 +2,7 @@
 tracker:
   kind: linear
   project_slug: "interconnection-agent-168eb6d2d969"
+  assignee: "me"
   workpad_marker: "## Codex Workpad"
   active_states:
     - Todo
