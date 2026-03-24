@@ -1,23 +1,17 @@
-import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, copyFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 const pluginRoot = resolve(import.meta.dirname, "..");
+const VAULTS_ROOT = "C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN";
 
-const TARGET_VAULTS = [
-	{
-		root: "C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\Notesandclippings\\Notesandclippings",
-		instanceId: "ee6b817756f5639c",
-	},
-	{
-		root: "C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\SPWR\\SPWR",
-		instanceId: "154dd54fbb28677a",
-	},
-	{
-		root: "C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\designandbuilding-vault\\designandbuilding-vault",
-		instanceId: "ff6a20e5b5ab012f",
-	},
-];
+const KNOWN_INSTANCE_IDS = new Map([
+	["C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\SPWR", "154dd54fbb28677a"],
+	["C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\designandbuilding-vault", "ff6a20e5b5ab012f"],
+	["C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\Obsidian Vault", "d9ad5d53b8c04e47"],
+	["C:\\dev\\Desktop-Projects\\Helpful-Docs-Prompts\\VAULTS-OBSIDIAN\\Solana-Grow", "5b38e127d20be493"],
+]);
 
 const DEFAULT_SETTINGS = {
 	workflowFilePath: "symphony/WORKFLOW.md",
@@ -43,9 +37,70 @@ const DEFAULT_RUNTIME = {
 };
 
 async function main() {
-	for (const target of TARGET_VAULTS) {
+	const targets = await discoverVaultTargets();
+	for (const target of targets) {
 		await installToVault(target);
 	}
+}
+
+async function discoverVaultTargets() {
+	const entries = await readdir(VAULTS_ROOT, { withFileTypes: true });
+	const targets = [];
+
+	for (const entry of entries) {
+		if (!entry.isDirectory()) {
+			continue;
+		}
+
+		const candidateRoot = join(VAULTS_ROOT, entry.name);
+		const vaultRoot = await resolveVaultRoot(candidateRoot);
+		if (!vaultRoot) {
+			continue;
+		}
+
+		targets.push({
+			root: vaultRoot,
+			instanceId: await resolveInstanceId(vaultRoot),
+		});
+	}
+
+	return targets;
+}
+
+async function resolveVaultRoot(candidateRoot) {
+	if (existsSync(join(candidateRoot, ".obsidian"))) {
+		return candidateRoot;
+	}
+
+	const entries = await readdir(candidateRoot, { withFileTypes: true });
+	for (const entry of entries) {
+		if (!entry.isDirectory()) {
+			continue;
+		}
+
+		const nestedRoot = join(candidateRoot, entry.name);
+		if (existsSync(join(nestedRoot, ".obsidian"))) {
+			return nestedRoot;
+		}
+	}
+
+	return null;
+}
+
+async function resolveInstanceId(vaultRoot) {
+	const existingDataPath = join(vaultRoot, ".obsidian", "plugins", "symphony", "data.json");
+	const existingData = await readJsonFile(existingDataPath);
+	const existingInstanceId = existingData?.settings?.symphonyInstanceId;
+	if (typeof existingInstanceId === "string" && existingInstanceId.trim()) {
+		return existingInstanceId.trim();
+	}
+
+	const knownInstanceId = KNOWN_INSTANCE_IDS.get(vaultRoot);
+	if (knownInstanceId) {
+		return knownInstanceId;
+	}
+
+	return createHash("sha256").update(vaultRoot.toLowerCase()).digest("hex").slice(0, 16);
 }
 
 async function installToVault(target) {
