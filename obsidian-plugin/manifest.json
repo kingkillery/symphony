@@ -3,7 +3,7 @@
 	"name": "Symphony",
 	"version": "0.1.0",
 	"minAppVersion": "1.5.0",
-	"description": "Desktop-only Obsidian scaffold for Symphony issue orchestration.",
+	"description": "Desktop-only Obsidian plugin for project-related issue orchestration.",
 	"author": "Preston Nackos",
 	"isDesktopOnly": true
 }

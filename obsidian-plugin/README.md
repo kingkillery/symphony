@@ -1,6 +1,6 @@
 # Symphony
 
-Symphony is an Obsidian desktop plugin scaffold for vault-driven issue orchestration.
+Symphony is an Obsidian desktop plugin for vault-driven issue orchestration.
 
 ## Workspace connection
 
@@ -19,17 +19,32 @@ that points back to this folder:
 This directory currently contains:
 
 - a desktop-only Obsidian plugin manifest
-- TypeScript build scaffolding
+- TypeScript build and bundle wiring
 - a live dashboard that indexes and dispatches eligible issue notes
-- command and settings wiring for a configurable external execution layer
+- retry-aware command and settings wiring for an external execution layer
 - a `SPEC.md` file containing the working product specification
 
 ## Execution layer
 
 Symphony now watches the configured issue folder, identifies project-related notes, and can
-dispatch eligible issues through a configurable runner command.
+dispatch eligible issues through a configurable runner command. Failed or interrupted runs are
+persisted and retried after restart when auto-dispatch is enabled.
 
-Configure the plugin settings with:
+Execution policy can be defined in `WORKFLOW.md` frontmatter and then overridden locally in the
+plugin settings when a machine-specific value is needed.
+
+Supported runtime keys in `WORKFLOW.md`:
+
+- `obsidian_plugin.runner_command_template`
+- `obsidian_plugin.auto_dispatch_project_tasks`
+- `obsidian_plugin.max_concurrent_runs`
+- `obsidian_plugin.runner_timeout_ms`
+- `obsidian_plugin.issue_folder_path`
+- `obsidian_plugin.project_related_marker`
+- `obsidian_plugin.desktop_workspace_root`
+- `obsidian_plugin.desktop_log_root`
+
+Local settings still exist for:
 
 - `Issue folder path`
 - `Project-related marker`
@@ -47,8 +62,8 @@ Supported runner template placeholders:
 
 What is not implemented yet:
 
-- workflow loading and validation
-- workflow-driven runner templating
-- retries, reconciliation, and runtime persistence
+- full workflow validation and templated prompt rendering
+- tracker writeback beyond note frontmatter
+- richer orchestration policies than direct shell dispatch
 
-Use this scaffold as the starting point for implementing the specification in `SPEC.md`.
+Use this plugin alongside the product specification in `SPEC.md`.

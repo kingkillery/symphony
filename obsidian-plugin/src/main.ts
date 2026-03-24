@@ -22,6 +22,12 @@ import {
 import { buildIssueIndex, type IndexedIssue, type IssueIndexSnapshot } from "./issue-index";
 import { DEFAULT_SETTINGS, type SymphonySettings } from "./settings";
 import {
+	EMPTY_WORKFLOW_CONFIG,
+	loadWorkflowConfig,
+	mergeSettingsWithWorkflow,
+	type WorkflowConfigSnapshot,
+} from "./workflow-config";
+import {
 	SYMPHONY_DASHBOARD_VIEW_TYPE,
 	SymphonyDashboardView,
 } from "./ui/symphony-dashboard-view";
@@ -29,30 +35,65 @@ import {
 interface ActiveExecution {
 	issuePath: string;
 	issueTitle: string;
+	attempt: number;
 	startedAt: number;
 	startResult: ExecutionStartResult;
 }
 
+interface RetryEntry {
+	issuePath: string;
+	issueTitle: string;
+	attempts: number;
+	dueAt: number;
+	reason: string;
+}
+
+interface PersistedActiveIssue {
+	issuePath: string;
+	issueTitle: string;
+	attempt: number;
+	startedAt: number;
+}
+
+interface PersistedRuntimeState {
+	recentExecutions: ExecutionJob[];
+	retryQueue: RetryEntry[];
+	activeIssues: PersistedActiveIssue[];
+}
+
+interface PersistedPluginData {
+	settings: SymphonySettings;
+	runtime: PersistedRuntimeState;
+}
+
 const COMPLETED_RUNTIME_STATES = new Set(["completed", "failed", "cancelled"]);
 const HUMAN_REVIEW_STATE = "Human Review";
+const RETRY_BASE_DELAY_MS = 5_000;
+const RETRY_MAX_DELAY_MS = 60_000;
 
 export default class SymphonyPlugin extends Plugin {
 	settings: SymphonySettings = DEFAULT_SETTINGS;
+	private workflowConfig: WorkflowConfigSnapshot = EMPTY_WORKFLOW_CONFIG;
 	private issueIndex: IssueIndexSnapshot | null = null;
 	private refreshTimeout: number | null = null;
+	private retryTimeout: number | null = null;
+	private isUnloading = false;
 	private readonly processRunner = new NodeExecutionProcessRunner();
 	private readonly activeExecutions = new Map<string, ActiveExecution>();
+	private readonly retryQueue = new Map<string, RetryEntry>();
 	private recentExecutions: ExecutionJob[] = [];
+	private persistedActiveIssues: PersistedActiveIssue[] = [];
 	private readonly finalizedJobIds = new Set<string>();
+	private readonly noRetryJobIds = new Set<string>();
 
 	async onload(): Promise<void> {
-		await this.loadSettings();
+		await this.loadPluginData();
 		this.registerView(
 			SYMPHONY_DASHBOARD_VIEW_TYPE,
 			(leaf) =>
 				new SymphonyDashboardView(
 					leaf,
-					() => this.settings,
+					() => this.getEffectiveSettings(),
 					() => this.issueIndex,
 					() => this.getExecutionSummaries(),
 				),
@@ -63,40 +104,26 @@ export default class SymphonyPlugin extends Plugin {
 		this.registerVaultEvents();
 
 		this.app.workspace.onLayoutReady(() => {
-			void this.refreshIssueIndex();
+			void this.initializeRuntime();
 
-			if (this.settings.dashboardOpenOnStart) {
+			if (this.getEffectiveSettings().dashboardOpenOnStart) {
 				void this.activateDashboardView();
 			}
 
-			if (this.settings.autoStart) {
+			if (this.getEffectiveSettings().autoStart) {
 				new Notice("Symphony runtime loaded. Project-related Obsidian tasks will dispatch when eligible.", 7000);
 			}
 		});
 	}
 
 	async onunload(): Promise<void> {
-		if (this.refreshTimeout !== null) {
-			window.clearTimeout(this.refreshTimeout);
-		}
-
+		this.isUnloading = true;
+		this.clearTimers();
+		await this.persistPluginData();
 		await Promise.all(
 			Array.from(this.activeExecutions.values(), (execution) => execution.startResult.cancel("Plugin unloaded")),
 		);
-
 		await this.app.workspace.detachLeavesOfType(SYMPHONY_DASHBOARD_VIEW_TYPE);
-	}
-
-	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-		this.normalizeSettings();
-	}
-
-	async saveSettings(): Promise<void> {
-		this.normalizeSettings();
-		await this.saveData(this.settings);
-		await this.refreshIssueIndex();
-		this.rerenderDashboardViews();
 	}
 
 	getIssueIndex(): IssueIndexSnapshot | null {
@@ -109,6 +136,59 @@ export default class SymphonyPlugin extends Plugin {
 		);
 		const completed = this.recentExecutions.map((job) => summarizeExecutionJob(job));
 		return [...running, ...completed].slice(0, 20);
+	}
+
+	getEffectiveSettings(): SymphonySettings {
+		return mergeSettingsWithWorkflow(this.settings, this.workflowConfig);
+	}
+
+	async saveSettings(): Promise<void> {
+		this.normalizeSettings();
+		await this.persistPluginData();
+		await this.refreshIssueIndex();
+		this.rerenderDashboardViews();
+	}
+
+	private async initializeRuntime(): Promise<void> {
+		await this.refreshIssueIndex();
+		await this.recoverInterruptedExecutions();
+		await this.refreshIssueIndex();
+	}
+
+	private async loadPluginData(): Promise<void> {
+		const data = await this.loadData();
+		if (isPersistedPluginData(data)) {
+			this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+			this.recentExecutions = limitExecutionJobs(data.runtime.recentExecutions);
+			this.persistedActiveIssues = Array.isArray(data.runtime.activeIssues) ? data.runtime.activeIssues : [];
+			for (const retry of data.runtime.retryQueue ?? []) {
+				if (isRetryEntry(retry)) {
+					this.retryQueue.set(retry.issuePath, retry);
+				}
+			}
+		} else {
+			this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
+			this.recentExecutions = [];
+			this.persistedActiveIssues = [];
+		}
+
+		this.normalizeSettings();
+	}
+
+	private async persistPluginData(): Promise<void> {
+		await this.saveData({
+			settings: this.settings,
+			runtime: {
+				recentExecutions: this.recentExecutions.slice(0, 20),
+				retryQueue: Array.from(this.retryQueue.values()),
+				activeIssues: Array.from(this.activeExecutions.values(), (execution) => ({
+					issuePath: execution.issuePath,
+					issueTitle: execution.issueTitle,
+					attempt: execution.attempt,
+					startedAt: execution.startedAt,
+				})),
+			},
+		} satisfies PersistedPluginData);
 	}
 
 	private normalizeSettings(): void {
@@ -126,6 +206,17 @@ export default class SymphonyPlugin extends Plugin {
 			if (leaf.view instanceof SymphonyDashboardView) {
 				leaf.view.render();
 			}
+		}
+	}
+
+	private clearTimers(): void {
+		if (this.refreshTimeout !== null) {
+			window.clearTimeout(this.refreshTimeout);
+			this.refreshTimeout = null;
+		}
+		if (this.retryTimeout !== null) {
+			window.clearTimeout(this.retryTimeout);
+			this.retryTimeout = null;
 		}
 	}
 
@@ -188,7 +279,7 @@ export default class SymphonyPlugin extends Plugin {
 	private registerVaultEvents(): void {
 		const refresh = (file: TAbstractFile | null | undefined) => {
 			if (!file || this.shouldRefreshForFile(file.path)) {
-				this.scheduleIssueIndexRefresh();
+				this.scheduleRefresh();
 			}
 		};
 
@@ -197,7 +288,7 @@ export default class SymphonyPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on("delete", (file) => refresh(file)));
 		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
 			if (this.shouldRefreshForFile(oldPath)) {
-				this.scheduleIssueIndexRefresh();
+				this.scheduleRefresh();
 				return;
 			}
 			refresh(file);
@@ -207,11 +298,15 @@ export default class SymphonyPlugin extends Plugin {
 
 	private shouldRefreshForFile(path: string): boolean {
 		const normalizedPath = normalizePath(path);
-		const issueFolder = this.settings.issueFolderPath;
-		return normalizedPath.endsWith(".md") && normalizedPath.startsWith(`${issueFolder}/`);
+		const effective = this.getEffectiveSettings();
+		return (
+			normalizedPath === this.settings.workflowFilePath ||
+			(normalizedPath.endsWith(".md") &&
+				(normalizedPath === effective.issueFolderPath || normalizedPath.startsWith(`${effective.issueFolderPath}/`)))
+		);
 	}
 
-	private scheduleIssueIndexRefresh(): void {
+	private scheduleRefresh(): void {
 		if (this.refreshTimeout !== null) {
 			window.clearTimeout(this.refreshTimeout);
 		}
@@ -222,39 +317,95 @@ export default class SymphonyPlugin extends Plugin {
 		}, 200);
 	}
 
+	private scheduleRetryReconcile(): void {
+		if (this.retryTimeout !== null) {
+			window.clearTimeout(this.retryTimeout);
+			this.retryTimeout = null;
+		}
+
+		const effective = this.getEffectiveSettings();
+		if (!effective.autoDispatchProjectTasks || this.retryQueue.size === 0) {
+			return;
+		}
+
+		const nextDueAt = Math.min(...Array.from(this.retryQueue.values(), (entry) => entry.dueAt));
+		const delay = Math.max(0, nextDueAt - Date.now());
+		this.retryTimeout = window.setTimeout(() => {
+			this.retryTimeout = null;
+			void this.refreshIssueIndex();
+		}, delay);
+	}
+
+	private async refreshWorkflowConfig(): Promise<void> {
+		this.workflowConfig = loadWorkflowConfig(this.app.vault, this.app.metadataCache, this.settings.workflowFilePath);
+	}
+
 	private async refreshIssueIndex(): Promise<IssueIndexSnapshot> {
+		await this.refreshWorkflowConfig();
+		const effective = this.getEffectiveSettings();
 		this.issueIndex = buildIssueIndex(
 			this.app.vault,
-			this.settings,
+			effective,
 			(file) => this.app.metadataCache.getFileCache(file),
 		);
 		this.rerenderDashboardViews();
+		this.scheduleRetryReconcile();
 		await this.reconcileExecution();
 		return this.issueIndex;
+	}
+
+	private async recoverInterruptedExecutions(): Promise<void> {
+		if (this.persistedActiveIssues.length === 0) {
+			return;
+		}
+
+		const effective = this.getEffectiveSettings();
+		const interrupted = [...this.persistedActiveIssues];
+		this.persistedActiveIssues = [];
+
+		for (const snapshot of interrupted) {
+			const file = this.app.vault.getAbstractFileByPath(snapshot.issuePath);
+			if (!(file instanceof TFile)) {
+				continue;
+			}
+
+			await this.updateIssueFrontmatter(file, (frontmatter) => {
+				frontmatter.symphony_runtime_status = "cancelled";
+				frontmatter.symphony_last_completed_at = new Date().toISOString();
+				frontmatter.symphony_last_error = "Execution interrupted by Obsidian restart";
+			});
+
+			if (effective.autoDispatchProjectTasks && effective.runnerCommandTemplate.trim()) {
+				this.enqueueRetry(snapshot.issuePath, snapshot.issueTitle, "Recovered after restart", snapshot.attempt + 1);
+			}
+		}
+
+		await this.persistPluginData();
 	}
 
 	private async reconcileExecution(): Promise<void> {
 		if (!this.issueIndex) {
 			return;
 		}
-		if (!this.settings.autoDispatchProjectTasks) {
-			return;
-		}
-		if (!this.settings.runnerCommandTemplate.trim()) {
+
+		const effective = this.getEffectiveSettings();
+		if (!effective.autoDispatchProjectTasks || !effective.runnerCommandTemplate.trim()) {
 			return;
 		}
 
-		const availableSlots = Math.max(0, this.settings.maxConcurrentRuns - this.activeExecutions.size);
+		const availableSlots = Math.max(0, effective.maxConcurrentRuns - this.activeExecutions.size);
 		if (availableSlots === 0) {
 			return;
 		}
 
 		let remaining = availableSlots;
+		const now = Date.now();
+
 		for (const issue of this.issueIndex.issues) {
 			if (remaining <= 0) {
 				break;
 			}
-			if (!this.shouldDispatchIssue(issue)) {
+			if (!this.shouldDispatchIssue(issue, now)) {
 				continue;
 			}
 
@@ -265,7 +416,7 @@ export default class SymphonyPlugin extends Plugin {
 		}
 	}
 
-	private shouldDispatchIssue(issue: IndexedIssue): boolean {
+	private shouldDispatchIssue(issue: IndexedIssue, now: number): boolean {
 		if (!issue.eligible) {
 			return false;
 		}
@@ -275,13 +426,21 @@ export default class SymphonyPlugin extends Plugin {
 		if (issue.runtimeStatus === "running") {
 			return false;
 		}
+
+		const retryEntry = this.retryQueue.get(issue.path);
+		if (retryEntry && retryEntry.dueAt > now) {
+			return false;
+		}
+
 		if (
 			issue.lastDispatchedState &&
 			issue.lastDispatchedState === issue.state &&
-			COMPLETED_RUNTIME_STATES.has(issue.runtimeStatus)
+			COMPLETED_RUNTIME_STATES.has(issue.runtimeStatus) &&
+			!retryEntry
 		) {
 			return false;
 		}
+
 		return true;
 	}
 
@@ -289,6 +448,7 @@ export default class SymphonyPlugin extends Plugin {
 		await this.refreshIssueIndex();
 
 		const issue = this.issueIndex?.issues.find((entry) => entry.path === file.path);
+		const effective = this.getEffectiveSettings();
 		if (!issue) {
 			new Notice(`No Symphony issue metadata found for ${file.path}.`);
 			return;
@@ -297,12 +457,16 @@ export default class SymphonyPlugin extends Plugin {
 			new Notice(`Current note is not eligible for work: ${issue.title}.`);
 			return;
 		}
-		if (!this.settings.runnerCommandTemplate.trim()) {
-			new Notice("Set a runner command template before dispatching work.");
+		if (!effective.runnerCommandTemplate.trim()) {
+			new Notice("Set a runner command template in settings or WORKFLOW.md before dispatching work.");
 			return;
 		}
 		if (this.activeExecutions.has(issue.path)) {
 			new Notice(`Symphony is already working on ${issue.title}.`);
+			return;
+		}
+		if (this.activeExecutions.size >= effective.maxConcurrentRuns) {
+			new Notice(`Symphony is already using all ${effective.maxConcurrentRuns} execution slot(s).`);
 			return;
 		}
 
@@ -319,6 +483,7 @@ export default class SymphonyPlugin extends Plugin {
 			return;
 		}
 
+		this.noRetryJobIds.add(execution.startResult.runningJob.id);
 		await execution.startResult.cancel("Stopped from Obsidian");
 		new Notice(`Stopping work on ${execution.issueTitle}.`, 5000);
 	}
@@ -329,9 +494,15 @@ export default class SymphonyPlugin extends Plugin {
 			return false;
 		}
 
+		const effective = this.getEffectiveSettings();
+		const retryEntry = this.retryQueue.get(issue.path);
+		const attempt = retryEntry?.attempts ?? 1;
+		this.retryQueue.delete(issue.path);
+		this.scheduleRetryReconcile();
+
 		const vaultPath = this.getVaultBasePath();
-		const workspaceRoot = await this.ensureWorkspaceRoot(vaultPath);
-		const logRoot = await this.ensureLogRoot(vaultPath);
+		const workspaceRoot = await this.ensureWorkspaceRoot(vaultPath, effective.desktopWorkspaceRoot);
+		const logRoot = await this.ensureLogRoot(vaultPath, effective.desktopLogRoot);
 		const jobId = `${issue.path}:${Date.now()}`;
 
 		await this.updateIssueFrontmatter(file, (frontmatter) => {
@@ -344,6 +515,8 @@ export default class SymphonyPlugin extends Plugin {
 			frontmatter.symphony_runtime_status = "running";
 			frontmatter.symphony_last_dispatched_state = dispatchedState || issue.state;
 			frontmatter.symphony_last_started_at = new Date().toISOString();
+			frontmatter.symphony_retry_attempt = attempt;
+			delete frontmatter.symphony_last_error;
 		});
 
 		const startResult = await this.processRunner.start(
@@ -358,22 +531,24 @@ export default class SymphonyPlugin extends Plugin {
 					logRoot,
 				},
 				template: {
-					command: this.settings.runnerCommandTemplate,
+					command: effective.runnerCommandTemplate,
 					shell: true,
 				},
 			},
 			{
 				workingDirectory: workspaceRoot || undefined,
-				timeoutMs: this.settings.runnerTimeoutMs ?? undefined,
+				timeoutMs: effective.runnerTimeoutMs ?? undefined,
 			},
 		);
 
 		this.activeExecutions.set(issue.path, {
 			issuePath: issue.path,
 			issueTitle: issue.title,
+			attempt,
 			startedAt: Date.now(),
 			startResult,
 		});
+		await this.persistPluginData();
 		this.rerenderDashboardViews();
 
 		void startResult.completed.then((job) => this.finalizeExecution(issue.path, issue.title, job, logRoot));
@@ -390,14 +565,24 @@ export default class SymphonyPlugin extends Plugin {
 			return;
 		}
 		this.finalizedJobIds.add(job.id);
+
+		const activeExecution = this.activeExecutions.get(issuePath);
+		const attempt = activeExecution?.attempt ?? 1;
 		this.activeExecutions.delete(issuePath);
 		this.recentExecutions = [job, ...this.recentExecutions].slice(0, 20);
+
+		const shouldRetry = this.shouldRetryJob(job);
+		if (shouldRetry) {
+			this.enqueueRetry(issuePath, issueTitle, summarizeExecutionJob(job).outcome, attempt + 1);
+		}
 
 		const file = this.app.vault.getAbstractFileByPath(issuePath);
 		if (file instanceof TFile) {
 			await this.updateIssueFrontmatter(file, (frontmatter) => {
-				frontmatter.symphony_runtime_status = job.state;
+				frontmatter.symphony_runtime_status = shouldRetry ? "retry-queued" : job.state;
 				frontmatter.symphony_last_completed_at = new Date().toISOString();
+				frontmatter.symphony_last_error = shouldRetry ? summarizeExecutionJob(job).outcome : "";
+				frontmatter.symphony_retry_attempt = attempt;
 
 				if ("exitCode" in job) {
 					frontmatter.symphony_last_exit_code = job.exitCode;
@@ -411,8 +596,32 @@ export default class SymphonyPlugin extends Plugin {
 		}
 
 		await this.writeExecutionLog(logRoot, issuePath, issueTitle, job);
+		await this.persistPluginData();
 		this.rerenderDashboardViews();
+		this.scheduleRetryReconcile();
 		await this.refreshIssueIndex();
+	}
+
+	private shouldRetryJob(job: ExecutionJob): boolean {
+		if (this.isUnloading) {
+			return false;
+		}
+		if (this.noRetryJobIds.has(job.id)) {
+			return false;
+		}
+		return job.state === "failed" || job.state === "cancelled";
+	}
+
+	private enqueueRetry(issuePath: string, issueTitle: string, reason: string, attempts: number): void {
+		const dueAt = Date.now() + calculateRetryDelay(attempts);
+		this.retryQueue.set(issuePath, {
+			issuePath,
+			issueTitle,
+			attempts,
+			dueAt,
+			reason,
+		});
+		this.scheduleRetryReconcile();
 	}
 
 	private async writeExecutionLog(
@@ -445,14 +654,14 @@ export default class SymphonyPlugin extends Plugin {
 		await writeFile(join(logRoot, filename), content, "utf8");
 	}
 
-	private async ensureWorkspaceRoot(vaultPath: string): Promise<string> {
-		const root = this.settings.desktopWorkspaceRoot.trim() || join(vaultPath || ".", ".symphony-workspaces");
+	private async ensureWorkspaceRoot(vaultPath: string, configuredRoot: string): Promise<string> {
+		const root = configuredRoot.trim() || join(vaultPath || ".", ".symphony-workspaces");
 		await mkdir(root, { recursive: true });
 		return root;
 	}
 
-	private async ensureLogRoot(vaultPath: string): Promise<string> {
-		const root = this.settings.desktopLogRoot.trim() || join(vaultPath || ".", ".symphony-logs");
+	private async ensureLogRoot(vaultPath: string, configuredRoot: string): Promise<string> {
+		const root = configuredRoot.trim() || join(vaultPath || ".", ".symphony-logs");
 		await mkdir(root, { recursive: true });
 		return root;
 	}
@@ -516,12 +725,12 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h2", { text: "Symphony" });
 		containerEl.createEl("p", {
-			text: "This settings tab configures the execution layer for project-related Obsidian work.",
+			text: "Local settings provide defaults and host-specific overrides. Put shared execution policy in WORKFLOW.md.",
 		});
 
 		new Setting(containerEl)
 			.setName("Issue folder path")
-			.setDesc("Vault-relative folder where Symphony should look for project-related task notes.")
+			.setDesc("Fallback issue folder when WORKFLOW.md does not override it.")
 			.addText((text) =>
 				text
 					.setPlaceholder(DEFAULT_SETTINGS.issueFolderPath)
@@ -534,7 +743,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Project-related marker")
-			.setDesc("Frontmatter key or tag used to mark a note as work Symphony should pick up.")
+			.setDesc("Fallback note marker when WORKFLOW.md does not override it.")
 			.addText((text) =>
 				text
 					.setPlaceholder(DEFAULT_SETTINGS.projectRelatedMarker)
@@ -547,7 +756,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Runner command template")
-			.setDesc("Shell command used to work on an issue. Supports {{issue_path}}, {{issue_title}}, {{vault_path}}, {{workspace_root}}, and {{log_root}}.")
+			.setDesc("Local fallback runner when WORKFLOW.md does not define one.")
 			.addTextArea((text) =>
 				text
 					.setPlaceholder("codex exec \"Work on {{issue_path}}\"")
@@ -560,7 +769,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Auto-dispatch project tasks")
-			.setDesc("Automatically start eligible issue notes when refresh or vault events detect them.")
+			.setDesc("Local fallback for auto-dispatch when WORKFLOW.md does not define it.")
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.autoDispatchProjectTasks)
@@ -572,7 +781,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Max concurrent runs")
-			.setDesc("Maximum number of issue jobs Symphony should run at once.")
+			.setDesc("Local fallback concurrency limit when WORKFLOW.md does not define it.")
 			.addText((text) =>
 				text
 					.setPlaceholder(String(DEFAULT_SETTINGS.maxConcurrentRuns))
@@ -585,7 +794,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Runner timeout (ms)")
-			.setDesc("Optional timeout for a single issue run.")
+			.setDesc("Local fallback timeout when WORKFLOW.md does not define one.")
 			.addText((text) =>
 				text
 					.setPlaceholder("600000")
@@ -599,7 +808,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Workflow file path")
-			.setDesc("Vault-relative path to the workflow definition.")
+			.setDesc("Vault-relative WORKFLOW.md path used to load shared execution policy.")
 			.addText((text) =>
 				text
 					.setPlaceholder(DEFAULT_SETTINGS.workflowFilePath)
@@ -612,7 +821,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Desktop workspace root")
-			.setDesc("Absolute desktop path for per-issue workspaces. Defaults to a local .symphony-workspaces folder when blank.")
+			.setDesc("Host-local workspace root. Shared policy should usually leave this unset.")
 			.addText((text) =>
 				text
 					.setPlaceholder("C:\\work\\symphony")
@@ -625,7 +834,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Desktop log root")
-			.setDesc("Absolute desktop path for execution logs. Defaults to a local .symphony-logs folder when blank.")
+			.setDesc("Host-local log root. Shared policy should usually leave this unset.")
 			.addText((text) =>
 				text
 					.setPlaceholder("C:\\work\\symphony-logs")
@@ -650,7 +859,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Open dashboard on start")
-			.setDesc("Reveal the Symphony dashboard after the workspace layout is ready.")
+			.setDesc("Reveal the Symphony dashboard after layout is ready.")
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.dashboardOpenOnStart)
@@ -662,7 +871,7 @@ class SymphonySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("HTTP port override")
-			.setDesc("Optional loopback port for a future local HTTP API.")
+			.setDesc("Optional loopback port reserved for a future local HTTP API.")
 			.addText((text) =>
 				text
 					.setPlaceholder("3000")
@@ -686,4 +895,36 @@ class SymphonySettingTab extends PluginSettingTab {
 					}),
 			);
 	}
+}
+
+function calculateRetryDelay(attempt: number): number {
+	return Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1));
+}
+
+function limitExecutionJobs(jobs: unknown): ExecutionJob[] {
+	return Array.isArray(jobs) ? (jobs as ExecutionJob[]).slice(0, 20) : [];
+}
+
+function isRetryEntry(value: unknown): value is RetryEntry {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.issuePath === "string" &&
+		typeof record.issueTitle === "string" &&
+		typeof record.attempts === "number" &&
+		typeof record.dueAt === "number" &&
+		typeof record.reason === "string"
+	);
+}
+
+function isPersistedPluginData(value: unknown): value is PersistedPluginData {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+
+	const record = value as Record<string, unknown>;
+	return "settings" in record && "runtime" in record;
 }

@@ -1,7 +1,7 @@
 {
 	"name": "symphony",
 	"version": "0.1.0",
-	"description": "Obsidian desktop plugin scaffold for Symphony issue orchestration",
+	"description": "Obsidian desktop plugin for project-related issue orchestration",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",

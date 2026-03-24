@@ -45,13 +45,13 @@ export class SymphonyDashboardView extends ItemView {
 			cls: "symphony-dashboard__title",
 		});
 		intro.createEl("p", {
-			text: "This dashboard indexes project-related issue notes and dispatches eligible work through the configured runner command.",
+			text: "This dashboard indexes project-related issue notes and dispatches eligible work using the effective runtime policy from WORKFLOW.md plus local overrides.",
 			cls: "symphony-dashboard__meta",
 		});
 
 		const settingsSection = contentEl.createDiv({ cls: "symphony-dashboard__section" });
 		settingsSection.createEl("h3", {
-			text: "Current settings",
+			text: "Effective runtime config",
 			cls: "symphony-dashboard__title",
 		});
 
