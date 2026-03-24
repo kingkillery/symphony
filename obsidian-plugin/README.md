@@ -24,6 +24,23 @@ This directory currently contains:
 - retry-aware command and settings wiring for an external execution layer
 - a `SPEC.md` file containing the working product specification
 
+## Vault install
+
+Use the repo-owned installer to deploy the built plugin into the managed vault set:
+
+```bash
+npm run build
+npm run install:vaults
+```
+
+The installer:
+
+- copies `manifest.json`, `main.js`, and `styles.css` into each managed vault
+- ensures `symphony` is listed in `.obsidian/community-plugins.json`
+- writes plugin `data.json` using Obsidian's wrapped `{ settings, runtime }` structure
+- stamps each vault with its configured `symphonyInstanceId`
+- preserves existing runtime state when reinstalling
+
 ## Execution layer
 
 Symphony now watches the configured issue folder, identifies project-related notes, and can
