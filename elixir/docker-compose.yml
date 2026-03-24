@@ -13,6 +13,8 @@ services:
       SYMPHONY_LOGS_ROOT: /var/log/symphony
       SYMPHONY_WORKSPACES_ROOT: /var/lib/symphony/workspaces
       SYMPHONY_WORKFLOW_FILE: /opt/symphony/runtime/WORKFLOW.md
+      SYMPHONY_CODEX_HOME: /var/lib/symphony/codex-home
+      SYMPHONY_HOST_CODEX_DIR: /opt/symphony/host-codex
       SOURCE_REPO_URL: "${SOURCE_REPO_URL:-https://github.com/openai/symphony}"
       SOURCE_REPO_REF: "${SOURCE_REPO_REF:-}"
       SOURCE_REPO_SETUP_CMD: "${SOURCE_REPO_SETUP_CMD:-}"
@@ -21,7 +23,7 @@ services:
       - ./WORKFLOW.md:/opt/symphony/runtime/WORKFLOW.md:ro
       - symphony-logs:/var/log/symphony
       - symphony-workspaces:/var/lib/symphony/workspaces
-      - ${HOME}/.codex:/root/.codex
+      - ${HOME}/.codex:/opt/symphony/host-codex:ro
       - ${SOURCE_REPO_HOST_PATH:?Set SOURCE_REPO_HOST_PATH before starting docker compose.}:/host-source-repo:ro
 
 volumes:

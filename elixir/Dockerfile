@@ -26,6 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     HOME=/root \
     SYMPHONY_APP_ROOT=/opt/symphony \
+    SYMPHONY_CODEX_HOME=/var/lib/symphony/codex-home \
+    SYMPHONY_HOST_CODEX_DIR=/opt/symphony/host-codex \
     SYMPHONY_LOGS_ROOT=/var/log/symphony \
     SYMPHONY_WORKSPACES_ROOT=/var/lib/symphony/workspaces \
     SYMPHONY_WORKFLOW_FILE=/opt/symphony/WORKFLOW.md \
@@ -52,9 +54,9 @@ COPY docker/entrypoint.sh /usr/local/bin/symphony-entrypoint
 
 RUN sed -i 's/\r$//' /usr/local/bin/symphony-entrypoint && \
     chmod +x /usr/local/bin/symphony /usr/local/bin/symphony-entrypoint && \
-    mkdir -p /var/log/symphony /var/lib/symphony/workspaces /root/.codex
+    mkdir -p /var/log/symphony /var/lib/symphony/workspaces /var/lib/symphony/codex-home /opt/symphony/host-codex
 
-VOLUME ["/var/log/symphony", "/var/lib/symphony/workspaces", "/root/.codex"]
+VOLUME ["/var/log/symphony", "/var/lib/symphony/workspaces", "/var/lib/symphony/codex-home"]
 
 EXPOSE 4000
 
