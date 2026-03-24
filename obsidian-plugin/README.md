@@ -60,6 +60,18 @@ Supported runner template placeholders:
 - `{{workspace_root}}`
 - `{{log_root}}`
 
+## Commands
+
+The plugin now exposes command-palette actions for vault-native task intake:
+
+- `Symphony: Create Symphony task`
+- `Symphony: Assign current note to Symphony`
+- `Symphony: Run current issue`
+- `Symphony: Stop current issue`
+
+Use `Symphony instance ID` in plugin settings to stamp created or assigned notes with the
+vault's Symphony instance identifier.
+
 What is not implemented yet:
 
 - full workflow validation and templated prompt rendering

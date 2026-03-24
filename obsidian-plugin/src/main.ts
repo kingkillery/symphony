@@ -67,6 +67,7 @@ interface PersistedPluginData {
 }
 
 const COMPLETED_RUNTIME_STATES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_NOTE_STATES = new Set(["done", "closed", "cancelled", "canceled", "archive", "archived"]);
 const HUMAN_REVIEW_STATE = "Human Review";
 const RETRY_BASE_DELAY_MS = 5_000;
 const RETRY_MAX_DELAY_MS = 60_000;
@@ -194,6 +195,7 @@ export default class SymphonyPlugin extends Plugin {
 	private normalizeSettings(): void {
 		this.settings.issueFolderPath = normalizePath(this.settings.issueFolderPath);
 		this.settings.workflowFilePath = normalizePath(this.settings.workflowFilePath);
+		this.settings.symphonyInstanceId = this.settings.symphonyInstanceId.trim();
 		this.settings.maxConcurrentRuns = Math.max(1, Number(this.settings.maxConcurrentRuns) || 1);
 		this.settings.runnerTimeoutMs =
 			this.settings.runnerTimeoutMs === null || this.settings.runnerTimeoutMs === undefined
@@ -238,6 +240,31 @@ export default class SymphonyPlugin extends Plugin {
 					`Symphony refreshed ${snapshot.projectRelatedCount} project task(s); ${snapshot.eligibleCount} eligible for work.`,
 					5000,
 				);
+			},
+		});
+
+		this.addCommand({
+			id: "create-symphony-task-note",
+			name: "Create Symphony task",
+			callback: async () => {
+				await this.createSymphonyTaskNote();
+			},
+		});
+
+		this.addCommand({
+			id: "assign-current-note-to-symphony",
+			name: "Assign current note to Symphony",
+			editorCheckCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) {
+					return false;
+				}
+
+				if (!checking) {
+					void this.assignCurrentNoteToSymphony(view.file);
+				}
+
+				return true;
 			},
 		});
 
@@ -442,6 +469,63 @@ export default class SymphonyPlugin extends Plugin {
 		}
 
 		return true;
+	}
+
+	private async createSymphonyTaskNote(): Promise<void> {
+		const effective = this.getEffectiveSettings();
+		const taskTitle = window.prompt("Symphony task title");
+		if (taskTitle === null) {
+			return;
+		}
+
+		const title = taskTitle.trim();
+		if (!title) {
+			new Notice("Task title is required.");
+			return;
+		}
+
+		await this.ensureVaultFolder(effective.issueFolderPath);
+		const filePath = await this.getAvailableIssuePath(effective.issueFolderPath, title);
+		const file = await this.app.vault.create(filePath, this.buildSymphonyTaskContent(title));
+		await this.app.workspace.getLeaf(true).openFile(file);
+		await this.refreshIssueIndex();
+		new Notice(`Created Symphony task ${title}.`, 5000);
+	}
+
+	private async assignCurrentNoteToSymphony(file: TFile): Promise<void> {
+		const effective = this.getEffectiveSettings();
+		const originalPath = file.path;
+		let moved = false;
+
+		await this.ensureVaultFolder(effective.issueFolderPath);
+		if (!this.isIssueFilePath(file.path, effective.issueFolderPath)) {
+			const targetPath = await this.getAvailableIssuePath(effective.issueFolderPath, file.basename);
+			await this.app.fileManager.renameFile(file, targetPath);
+			moved = true;
+		}
+
+		await this.updateIssueFrontmatter(file, (frontmatter) => {
+			this.setProjectMarker(frontmatter, effective.projectRelatedMarker, true);
+
+			const explicitState = this.readExplicitIssueState(frontmatter);
+			if (!explicitState || TERMINAL_NOTE_STATES.has(explicitState.toLowerCase())) {
+				frontmatter.state = "Todo";
+			}
+
+			const instanceId = this.settings.symphonyInstanceId.trim();
+			if (instanceId) {
+				frontmatter.symphony_instance_id = instanceId;
+			}
+			frontmatter.symphony_assigned_at = new Date().toISOString();
+			if (moved && typeof frontmatter.symphony_source_path !== "string") {
+				frontmatter.symphony_source_path = originalPath;
+			}
+		});
+
+		await this.app.workspace.getLeaf(true).openFile(file);
+		await this.refreshIssueIndex();
+		const destination = moved ? ` and moved it to ${file.path}` : "";
+		new Notice(`Assigned ${file.basename} to Symphony${destination}.`, 5000);
 	}
 
 	private async dispatchCurrentIssue(file: TFile): Promise<void> {
@@ -680,14 +764,86 @@ export default class SymphonyPlugin extends Plugin {
 		});
 	}
 
-	private readIssueState(frontmatter: Record<string, unknown>): string {
+	private buildSymphonyTaskContent(title: string): string {
+		const marker = this.getEffectiveSettings().projectRelatedMarker;
+		const now = new Date().toISOString();
+		const lines = [
+			"---",
+			`title: ${this.toYamlString(title)}`,
+			"state: Todo",
+			`${marker}: true`,
+			`symphony_created_at: ${this.toYamlString(now)}`,
+		];
+
+		const instanceId = this.settings.symphonyInstanceId.trim();
+		if (instanceId) {
+			lines.push(`symphony_instance_id: ${this.toYamlString(instanceId)}`);
+		}
+
+		lines.push("---", "", `# ${title}`, "", "## Objective", "", "## Context", "", "## Definition of done", "");
+		return lines.join("\n");
+	}
+
+	private async ensureVaultFolder(folderPath: string): Promise<void> {
+		const normalizedFolderPath = normalizePath(folderPath);
+		if (!normalizedFolderPath) {
+			return;
+		}
+
+		const segments = normalizedFolderPath.split("/").filter(Boolean);
+		let currentPath = "";
+		for (const segment of segments) {
+			currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+			if (!this.app.vault.getAbstractFileByPath(currentPath)) {
+				await this.app.vault.createFolder(currentPath);
+			}
+		}
+	}
+
+	private async getAvailableIssuePath(issueFolderPath: string, title: string): Promise<string> {
+		const baseName = `${this.toTimestampPrefix()}-${this.toSafeName(title).toLowerCase() || "task"}`;
+		let suffix = 0;
+
+		for (;;) {
+			const filename = suffix === 0 ? `${baseName}.md` : `${baseName}-${suffix + 1}.md`;
+			const candidatePath = normalizePath(`${issueFolderPath}/${filename}`);
+			if (!this.app.vault.getAbstractFileByPath(candidatePath)) {
+				return candidatePath;
+			}
+			suffix += 1;
+		}
+	}
+
+	private isIssueFilePath(filePath: string, issueFolderPath: string): boolean {
+		const normalizedFilePath = normalizePath(filePath);
+		const normalizedIssueFolder = normalizePath(issueFolderPath);
+		return normalizedFilePath.startsWith(`${normalizedIssueFolder}/`);
+	}
+
+	private setProjectMarker(frontmatter: Record<string, unknown>, marker: string, value: boolean): void {
+		frontmatter[marker] = value;
+	}
+
+	private readExplicitIssueState(frontmatter: Record<string, unknown>): string {
 		const state = typeof frontmatter.state === "string" ? frontmatter.state.trim() : "";
 		const status = typeof frontmatter.status === "string" ? frontmatter.status.trim() : "";
-		return state || status || "Todo";
+		return state || status || "";
+	}
+
+	private readIssueState(frontmatter: Record<string, unknown>): string {
+		return this.readExplicitIssueState(frontmatter) || "Todo";
 	}
 
 	private toSafeName(value: string): string {
-		return value.replace(/[<>:"/\\|?*]+/g, "_");
+		return value.replace(/[<>:"/\\|?*]+/g, "_").replace(/\s+/g, "-");
+	}
+
+	private toTimestampPrefix(): string {
+		return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "");
+	}
+
+	private toYamlString(value: string): string {
+		return JSON.stringify(value);
 	}
 
 	private async activateDashboardView(): Promise<void> {
@@ -750,6 +906,19 @@ class SymphonySettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.projectRelatedMarker)
 					.onChange(async (value) => {
 						this.plugin.settings.projectRelatedMarker = value.trim() || DEFAULT_SETTINGS.projectRelatedMarker;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Symphony instance ID")
+			.setDesc("Per-vault Symphony instance identifier stamped onto created and assigned tasks.")
+			.addText((text) =>
+				text
+					.setPlaceholder("ee6b817756f5639c")
+					.setValue(this.plugin.settings.symphonyInstanceId)
+					.onChange(async (value) => {
+						this.plugin.settings.symphonyInstanceId = value.trim();
 						await this.plugin.saveSettings();
 					}),
 			);
