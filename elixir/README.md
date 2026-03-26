@@ -128,17 +128,19 @@ Suggested setup:
 ```bash
 cd symphony/elixir
 fly launch --no-deploy --copy-config
-fly volumes create symphony_data --region den --size 20
-fly secrets set LINEAR_API_KEY=... OPENAI_API_KEY=...
+fly volumes create symphony_data --region dfw --size 20
+fly secrets set LINEAR_API_KEY=... OPENAI_API_KEY=... SYMPHONY_DASHBOARD_USERNAME=... SYMPHONY_DASHBOARD_PASSWORD=...
 fly deploy
 ```
 
 Notes:
 
 - The Fly config stores logs, workspaces, and Symphony's isolated Codex home under `/data`.
+- The dashboard and API are protected with HTTP basic auth using `SYMPHONY_DASHBOARD_USERNAME`
+  and `SYMPHONY_DASHBOARD_PASSWORD`.
 - `SOURCE_REPO_URL` defaults to `https://github.com/kingkillery/symphony` in `fly.toml`; change it
   if the worker should clone a different repository into each issue workspace.
-- The dashboard is exposed on Fly over port `4000` with a basic `GET /` health check.
+- The dashboard is exposed on Fly over port `4000` with a `GET /health` health check.
 - Fly volumes are attached per-machine, so keep this deployment as a single-machine service unless
   you add external coordination for claim/routing state.
 

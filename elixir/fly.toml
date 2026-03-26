@@ -24,7 +24,7 @@ primary_region = "dfw"
     grace_period = "30s"
     interval = "15s"
     method = "GET"
-    path = "/"
+    path = "/health"
     timeout = "10s"
 
 [[mounts]]
